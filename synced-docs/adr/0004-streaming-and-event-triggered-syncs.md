@@ -21,6 +21,87 @@
   until the OIDC follow-up (#903) lands. The Context section's `serve` citations
   describe the pre-#854 code deliberately — they are the evidence the
   decision was made on.
+- **Amended:** 2026-08-06 — [ADR 0005](0005-state-location-and-write-grants.md)
+  corrects the 2026-07-29 amendment below: the #769 cross-process residual
+  does not close via #756 after all. That amendment was right that a
+  cross-process token bucket needs shared state and wrong about what *kind* —
+  low-latency atomic increment, which neither of #756's backends provide (the
+  object-storage half has no cheap compare-and-swap and pays a round trip per
+  acquire; a warehouse table is worse on both counts). Re-scoped out to its own
+  issue, [#921](https://github.com/drt-hub/drt/issues/921), tracked as
+  unscheduled rather than folded into a gate it cannot close. Net effect on
+  ordering: none — #756 already blocked Tier 2 on durability grounds alone and
+  remains the longer pole; Tier 3 already cleared via #854 above, independent
+  of this correction.
+- **Amended:** 2026-08-14 — [#756](https://github.com/drt-hub/drt/issues/756)
+  shipped in [v0.9.0](https://github.com/drt-hub/drt/releases/tag/v0.9.0)
+  (2026-08-11): `state.backend: gcs | s3`, generation/ETag-preconditioned. The
+  Tier 2 gate clears — a sensor process and a CI-launched `drt run` can now
+  share a durable watermark. Tier 2 guidance may be promoted; the #921
+  cross-process rate-limit residual (2026-08-06 amendment above) is unrelated
+  to this gate and remains separately unscheduled.
+- **Amended:** 2026-08-14 — #855 shipped Delta and Iceberg sensor variants
+  ([#974](https://github.com/drt-hub/drt/pull/974)), **not** the Snowflake
+  `STREAM` variant this ADR's Follow-up issues section originally described.
+  Building it surfaced a fit problem the trigger matrix's "purpose-built
+  signals are designed to be polled cheaply" line (Trigger matrix section
+  above) understated: `SYSTEM$STREAM_HAS_DATA()` is a boolean that only
+  resets when the stream is *consumed* via DML, and a cursor-diff sensor
+  (the shape Delta/Iceberg use, and the only shape #855 built) polling a
+  value nothing in drt's read-only Snowflake extraction path ever consumes
+  would fire once on the first real change and then latch permanently silent
+  — the opposite of event-driven. Making it work would mean either the
+  sensor performing its own throwaway DML purely to reset the flag (a
+  write-grant escalation on a source connection this ADR never scoped, and
+  an [ADR 0005](0005-state-location-and-write-grants.md)-shaped decision on
+  its own), or substituting an unverified alternative signal. Tracked as
+  [#975](https://github.com/drt-hub/drt/issues/975) rather than solved here.
+  Net effect: **Tier 2 promotion is scoped to the sources with a shipped
+  sensor (Delta, Iceberg)** — Snowflake's change-detection story continues to
+  route through Tier 1 (native `TASK` + `WHEN SYSTEM$STREAM_HAS_DATA()`,
+  where DML consumption is a natural side effect of the task's own body) and
+  Tier 3 (`drt serve` behind Snowflake Alerts + `WEBHOOK`, already shipped
+  via #854), both unaffected by this gap. SQL Server Change Tracking was
+  never built and is folded into the same #975 follow-up rather than
+  assumed simpler by default.
+- **Amended:** 2026-08-17 — #975 closed the gap the amendment above
+  describes, **without retracting its finding**: `STREAM` +
+  `SYSTEM$STREAM_HAS_DATA()` remains the wrong signal for Tier 2, for
+  exactly the consumption-semantics reason given above. What #975 found
+  instead is a *different* function neither this ADR nor the trigger matrix
+  had considered: `SYSTEM$LAST_CHANGE_COMMIT_TIME('<table>')`, verified
+  against a real account to be monotonic and side-effect-free with no
+  stream, no consumption trap, and no `CHANGE_TRACKING`-style prerequisite.
+  SQL Server's `CHANGE_TRACKING_CURRENT_VERSION()` — already this ADR's
+  Tier 1 recommendation, per the trigger matrix's SQL Server section — was
+  verified to fit the same cursor-diff shape directly, no substitution
+  needed. Both now ship in `build_drt_change_sensor()`
+  ([#983](https://github.com/drt-hub/drt/pull/983) and the sensor PR that
+  followed it). **Tier 2 promotion now covers all four sources this ADR
+  named as candidates** (Delta, Iceberg, Snowflake, SQL Server). Snowflake's
+  signal call was later confirmed live ([#985](https://github.com/drt-hub/drt/issues/985))
+  to be metadata-only — it does **not** bill the profile's `warehouse=` or
+  trigger `AUTO_RESUME` — but it does open a fresh authenticated connection
+  on every poll, a real cost the object-storage signals don't have, which is
+  why `minimum_interval_seconds=` stays a required argument for it. SQL
+  Server has that same per-poll connection cost but isn't gated by an
+  equivalent required argument today.
+- **Amended:** 2026-08-31 — #1051 closed the asymmetry the amendment above
+  left open: `build_drt_change_sensor()` now requires
+  `minimum_interval_seconds=` for a SQL Server profile too, matching
+  Snowflake — `pymssql.connect()` has the same fresh-connection-per-poll
+  cost `snowflake.connector.connect()` does. **Breaking for any deployed
+  SQL Server sensor that didn't already pass `minimum_interval_seconds=`**
+  — ships as dagster-drt 0.5.0, not folded into a patch; see that
+  release's CHANGELOG entry for the upgrade note.
+- **Amended:** 2026-09-18 — [#903](https://github.com/drt-hub/drt/issues/903)
+  closed the last Tier 3 residual named in the 2026-08-03 amendment:
+  `drt serve --auth oidc` verifies Pub/Sub push's OIDC JWT (signature,
+  required `aud` + `email`, `iss`) via `google-auth` (`drt-core[serve-oidc]`),
+  so a
+  Pub/Sub push subscription can point at `drt serve` directly, no verifying
+  proxy required. Tier 3 now has no known residual against the shape this
+  ADR describes.
 - **Issue:** [#786](https://github.com/drt-hub/drt/issues/786)
 - **Implementation:** none — this ADR recommends **not** building a native
   watcher. The work it does sanction is listed under
@@ -128,17 +209,22 @@ rather than loudly, which is the worst failure mode a docs deliverable has.
 
 | Gate | Blocks | Status | Why |
 |---|---|---|---|
-| **#756 remote state** | Tier 2 | Open | `.drt/state.json` is local disk (`drt/state/manager.py:43`). A sensor in an orchestrator and a CI run genuinely cannot share a watermark today. A Tier 2 recommendation shipped before this tells users to build a topology whose two halves silently disagree about what has already synced. **Also absorbs the cross-process half of the #769 gate** — see the amendment below. |
-| **#769 rate limiting v2** | Tier 3 | **Cleared** by [#858](https://github.com/drt-hub/drt/pull/858) | Originally written as blocking Tier 2 *and* Tier 3. #858 shipped both named requirements — the **per-destination `rate_limit` override** and the **shared bucket across threads** — which is the whole scope for Tier 3, since `drt serve` is one long-lived process and the registry lives for the life of the server rather than resetting per run. It does not clear Tier 2: a Dagster sensor yields one `RunRequest` per changed sync and Dagster launches each as its own process, so N changed syncs against one endpoint is still N buckets. That residual needs shared state, which is #756 — hence the fold rather than a standing second gate. |
+| **#756 remote state** | Tier 2 | **Cleared** by [v0.9.0](https://github.com/drt-hub/drt/releases/tag/v0.9.0) (2026-08-11) | `.drt/state.json` was local disk (`drt/state/manager.py:43`), so a sensor in an orchestrator and a CI run genuinely could not share a watermark. `state.backend: gcs \| s3` now exists, generation/ETag-preconditioned per [ADR 0005](0005-state-location-and-write-grants.md) — no warehouse write required, matching the original gate scope. |
+| **#769 rate limiting v2** | Tier 3 | **Cleared** by [#858](https://github.com/drt-hub/drt/pull/858) | Originally written as blocking Tier 2 *and* Tier 3. #858 shipped both named requirements — the **per-destination `rate_limit` override** and the **shared bucket across threads** — which is the whole scope for Tier 3, since `drt serve` is one long-lived process and the registry lives for the life of the server rather than resetting per run. It does not clear Tier 2: a Dagster sensor yields one `RunRequest` per changed sync and Dagster launches each as its own process, so N changed syncs against one endpoint is still N buckets. That residual does **not** close via #756 — see the 2026-08-06 amendment above — and is tracked separately, unscheduled, as [#921](https://github.com/drt-hub/drt/issues/921). |
 
-**Amendment (2026-07-29), scoping the #769 gate.** As first written, this row's
-rationale ran together two distinct harms: per-destination pacing being
-unavailable at all, and a per-process bucket resetting every run. #858 fixes the
-first completely and the second only within a process. Because a cross-process
-bucket is not achievable without shared state, the residual is not independently
-actionable and has been folded into the #756 row rather than left as a gate that
-cannot be closed on its own terms. Net effect on ordering: none — #756 already
-blocked Tier 2 and remains the longer pole. Tier 3's blocker becomes #854.
+**Amendment (2026-07-29), scoping the #769 gate — corrected 2026-08-06, see the
+Status block above.** As first written, this row's rationale ran together two
+distinct harms: per-destination pacing being unavailable at all, and a
+per-process bucket resetting every run. #858 fixes the first completely and the
+second only within a process. Because a cross-process bucket is not achievable
+without shared state, the residual was folded into the #756 row rather than
+left as a gate that cannot be closed on its own terms. **That fold was itself
+wrong** — #756's state (object storage, and later a warehouse table) is
+durable but not low-latency-atomic, so neither of its backends actually closes
+this residual either. It is now [#921](https://github.com/drt-hub/drt/issues/921),
+unscheduled. Net effect on ordering: none either time — #756 already blocked
+Tier 2 on durability grounds alone and remains the longer pole. Tier 3's
+blocker becomes #854.
 
 One topology this does not cover: several `drt serve` replicas behind a load
 balancer are several processes, so the shared bucket degrades to one per replica.
@@ -263,14 +349,20 @@ the work it authorised:
    run id instead of holding the request open, and add HMAC signature
    verification alongside the bearer token.
 2. **[#855](https://github.com/drt-hub/drt/issues/855) — `dagster-drt` sensors**
-   (the Tier 2 path). A generic cheap-signal sensor plus Delta/Iceberg version
-   and Snowflake `STREAM` variants, yielding one `RunRequest` per changed sync.
-   The two lakehouse signals are the cheapest first sensors to write: Delta's
-   `version()` is already called in shipped code (`drt/sources/deltalake.py:91`)
-   and Iceberg's snapshot id is reachable from a table drt already loads
-   (`drt/sources/iceberg.py:51-52`). **Blocked by #756.**
+   (the Tier 2 path). **Closed** on the Delta and Iceberg variants
+   ([#974](https://github.com/drt-hub/drt/pull/974)) — a generic cheap-signal
+   sensor (`build_drt_change_sensor()`) plus both lakehouse signals, yielding
+   one `RunRequest` per changed sync. Delta's `version()` is already called in
+   shipped code (`drt/sources/deltalake.py:91`) and Iceberg's snapshot id is
+   reachable from a table drt already loads (`drt/sources/iceberg.py:51-52`).
+   The Snowflake `STREAM` variant this item originally described did not ship
+   — see the 2026-08-14 amendment above — and its replacement, plus SQL
+   Server, shipped instead via #975 and the 2026-08-17 amendment above
+   (`SYSTEM$LAST_CHANGE_COMMIT_TIME` / `CHANGE_TRACKING_CURRENT_VERSION()`).
 3. **[#856](https://github.com/drt-hub/drt/issues/856) — "event-driven syncs"
    guide** covering all three tiers. Tier 1 is documentable now; **Tier 2 is
-   gated on #756**, and **Tier 3 becomes publishable once #854 lands** — its
-   #769 gate cleared with [#858](https://github.com/drt-hub/drt/pull/858), per
-   the amendment above.
+   publishable for all four sources** (Delta/Iceberg via #855, Snowflake/SQL
+   Server via #975 and the 2026-08-17 amendment above — Snowflake's
+   compute-cost caveat is documented, not a reason to omit it); **Tier 3 is
+   publishable** — #854 landed, its #769 gate cleared with
+   [#858](https://github.com/drt-hub/drt/pull/858), per the amendment above.

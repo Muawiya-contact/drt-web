@@ -9,7 +9,7 @@
 
 ### The reverse leg of your data stack.
 
-dlt loads data in, dbt transforms it, and **drt** activates it back out — reverse ETL from your warehouse to the tools your team works in. Declarative YAML, one `drt run`.
+dlt loads data in, dbt transforms it, and **drt** activates it back out — reverse ETL from your warehouse to the tools your team works in, as YAML in your own repo. No dashboard to babysit, no audience builder duplicating what dbt already does, no hosted runtime billing you per row. Your data goes straight from your warehouse to the destination — never through a drt-hosted intermediary.
 
 <p align="center">
   <code>dlt</code> <sub>load</sub> &nbsp;→&nbsp; <code>dbt</code> <sub>transform</sub> &nbsp;→&nbsp; <b><code>drt</code></b> <sub>activate</sub>
@@ -175,6 +175,7 @@ drt profile add <name>      # interactively add a profile
 drt profile remove <name>   # remove a profile
 drt serve                   # start HTTP webhook endpoint
 drt docs generate --format mermaid  # print project DAG as Mermaid
+drt docs generate --format dbt-exposures  # print dbt exposure YAML for ref() syncs
 drt deploy github-actions   # scaffold a scheduled sync workflow (drt-action + secrets wired)
 drt mcp run                 # start MCP server (requires drt-core[mcp])
 drt --install-completion    # install shell completion (bash/zsh/fish)
@@ -326,7 +327,7 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 ### Destinations
 
 <details>
-<summary><b>34 destinations</b> — warehouses, SaaS APIs, cloud storage, files &amp; webhooks (click to expand)</summary>
+<summary><b>35 destinations</b> — warehouses, SaaS APIs, cloud storage, files &amp; webhooks (click to expand)</summary>
 
 | Connector               | Status    | Install                            | Auth                              |
 | ----------------------- | --------- | ---------------------------------- | --------------------------------- |
@@ -340,6 +341,7 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 | Klaviyo                 | ✅ v0.8   | (core)                             | Private API key (env var)         |
 | Mixpanel                | ✅ v0.8   | (core)                             | Project token / service account   |
 | Google Ads              | ✅ v0.6   | (core)                             | OAuth2 Client Credentials         |
+| Meta Conversions        | ✅ next   | (core)                             | Long-lived access token (env var) |
 | Google Sheets           | ✅ v0.4   | `pip install drt-core[sheets]`     | Service Account Keyfile           |
 | PostgreSQL (upsert)     | ✅ v0.4   | `pip install drt-core[postgres]`   | Password (env var)                |
 | MySQL (upsert)          | ✅ v0.4   | `pip install drt-core[mysql]`      | Password (env var)                |
@@ -384,7 +386,7 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 > **Issue-level tracking → [GitHub Milestones](https://github.com/drt-hub/drt/milestones)**
 > **Looking to contribute? → [Good First Issues](https://github.com/drt-hub/drt/issues?q=is%3Aopen+label%3A%22good+first+issue%22)**
 
-**Shipped:** now on **v0.8.3** — `--dry-run --diff` previews mirror `DELETE`s (all three strategies, read-only) on a keyed lookup that no longer scans the whole destination · `alerts.on_degraded` thresholds for the failures that *succeed* · `drt test` custom SQL `query` tests, `severity: warn`, `--store-failures`, on top of v0.8.2's single-object `drt docs --inline` (navigable hosted catalog on GCS/S3) and v0.8.1's `sync.match_policy` (`update_only` / `create_only` on Postgres + HubSpot) · manifest schema v2, on top of the v0.8.0 `drt docs` lineage site · project `vars:` · `drt build` · dbt-style selection v2. Grouped milestones below; the full per-release changelog lives in [CHANGELOG.md](CHANGELOG.md) and [GitHub Releases](https://github.com/drt-hub/drt/releases).
+**Shipped:** now on **v0.10.0** — Protocol stability and v1.0 freeze preparation (ADR 0007) · the ADR 0011 OSS product boundary · age-encrypted `.drt/secrets.toml` · `QueryableDestination` · entry-point plugins whose connector types work in sync YAML · dbt exposures export · reproducible benchmarks, real-I/O/PyO3 evidence, and ADR 0010's no-broad-rewrite recommendation · no-op-by-default Enterprise RBAC/audit extension seams (ADR 0008) · pluggable cross-process rate-limit coordination (ADR 0012) · separately versioned dagster-drt v0.4.0 event-driven sensors, on top of v0.9.0's remote state and delivery-contract foundation. Grouped milestones below; the full per-release changelog lives in [CHANGELOG.md](CHANGELOG.md) and [GitHub Releases](https://github.com/drt-hub/drt/releases).
 
 | Milestone            | Highlights                                                                                                                                                             |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -397,8 +399,11 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 | **v0.8.2** ✅        | **`drt docs --inline` → single navigable HTML object** — the whole catalog in one file with in-page nav, so it renders *and* navigates on an authenticated GCS / S3 object URL (completes v0.8.1's `--inline`) |
 | **v0.8.3** ✅        | **`--dry-run --diff` previews mirror `DELETE`s** (tracked / destination / scoped, read-only, labelled apart from a replace rebuild) · keyed destination lookup instead of a full scan · **`alerts.on_degraded`** (row-error %, duration SLA, empty source, DLQ depth) · `drt test` custom SQL `query` tests, `severity: warn`, `--store-failures` |
 | **v0.8.4** ✅        | **Mirror symmetry closes out** — `strategy: tracked` + `scope` composed together, on every SQL destination (Postgres/MySQL/Snowflake/ClickHouse/Databricks) · tracked mirror's state diff moves from Python to a server-side SQL join · **query tagging** (SQL comment + native BigQuery/Snowflake/Databricks tags) · streaming extraction · source-side retry · rate limiting v2 · `--full-refresh` + `drt state show/reset` |
+| **v0.8.5** ✅        | Databricks composite-key mirror fix — `sync.mode: mirror` + `tracked`/`scope` on a multi-column `upsert_key` now goes through `MERGE` instead of the tuple-`IN` anti-join Delta rejects |
+| **v0.9.0** ✅        | **Engine Foundation** — [ADR 0005](docs/adr/0005-state-location-and-write-grants.md) remote state (GCS/S3 backends for state/history/DLQ, CI-safe, team-shared) · `computed_fields` · `metadata_columns` + `run_id`/`sync_run_id` correlation · REST API `body_mode: batch` · `state:modified` selection · `sync.unit_tests` · secret provider URIs (AWS/GCP Secret Manager, Vault) · `drt serve` real delivery contract (coalescing, `202` + poll, pluggable auth) · CLI/MCP parity gate, 11 gaps closed |
+| **v0.10.0** ✅       | **Enterprise Boundary & Ecosystem** — Protocol stability/freeze prep · OSS product and Enterprise extension boundaries · age-encrypted project secrets · `QueryableDestination` · entry-point plugins usable from YAML · dbt exposures · benchmark/real-I/O/PyO3 evidence · pluggable rate-limit coordination · dagster-drt v0.4.0 event-driven sensors · FileDestination and least-privilege Snowflake mirror fixes |
 
-**Next:** [v0.9 Engine Foundation](ROADMAP.md#v09--engine-foundation) → [v0.10 Enterprise Boundary & Ecosystem](ROADMAP.md#v010--enterprise-boundary--ecosystem) → [v1.0 Stable Release](ROADMAP.md#v10--stable-release) → [v1.x Rust Engine](ROADMAP.md#v1x--rust-engine)
+**Next:** [v1.0 Stable Release](ROADMAP.md#v10--stable-release) → [v1.x Rust Engine](ROADMAP.md#v1x--rust-engine)
 
 ---
 
@@ -424,7 +429,14 @@ defs = Definitions(
 )
 ```
 
-See [dagster-drt README](integrations/dagster-drt/README.md) for full API docs (Translator, Pipes support, DrtConfig dry-run, MaterializeResult).
+For event-driven activation, `build_drt_change_sensor()` watches metadata-only
+change signals from Delta Lake, Iceberg, Snowflake, or SQL Server. The same
+resource also runs explicitly selected syncs from a plain Dagster `@op`, returns
+a chainable `DrtEventIterator` for source row-count checks, and powers the
+declarative `DrtSyncComponent` for `defs.yaml` projects.
+
+See [dagster-drt README](integrations/dagster-drt/README.md) for full API docs
+(sensors, Components, `@op`, Translator, Pipes support, and dry-run config).
 
 ---
 

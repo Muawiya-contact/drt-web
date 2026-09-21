@@ -11,17 +11,36 @@ dlt (load into DWH) → dbt (transform) → drt (activate out of DWH)
 ```
 
 - **Category:** Reverse ETL
-- **Tagline:** "Reverse ETL for the code-first data stack"
+- **Tagline:** "Reverse ETL as code — no UI, no lock-in, no per-row bill."
 - **Install:** `pip install drt-core` or `uv add drt-core`
 - **Package name:** `drt-core` (PyPI) — CLI command is `drt`
-- **Current version:** v0.8.4
+- **Current version:** v0.10.0
 
 ## What drt is NOT
+
+drt's competitive set is commercial reverse-ETL tools (Census, Hightouch,
+RudderStack Reverse ETL, and similar), not dlt or dbt — those are adjacent
+pipeline stages. Against that competitive set, four things are deliberately
+excluded from `drt-core`, not merely unbuilt — see
+[ADR 0011](../adr/0011-subtraction-positioning-vs-reverse-etl.md):
 
 - Not a data loader (that's dlt)
 - Not a transformer (that's dbt)
 - Not a scheduler — it runs via CLI or cron, not a built-in scheduler
-- Not a SaaS — fully self-hosted OSS (Apache 2.0)
+- Not a SaaS / hosted runtime — fully self-hosted OSS (Apache 2.0); data
+  goes straight from your warehouse to the destination, never through a
+  drt-hosted intermediary, and there is no per-row bill
+- Not a UI or dashboard — config-as-code (YAML, git-reviewable) is the
+  product, not a placeholder for one
+- Not an audience/segmentation builder — building the record set to sync is
+  a SQL/dbt-modeling problem; drt syncs exactly what the sync config's
+  `model` field points it at (raw SQL or a dbt-style reference)
+- Not a gatekept connector catalog, though not yet fully wired: the plugin
+  system discovers third-party `drt.destinations` entry points without
+  drt-hub approval, but a registered type can't be named in sync YAML yet
+  (closed config union — see ADR 0009, follow-up #997). No standing
+  gatekeeping policy exists, unlike a commercial vendor's closed catalog
+  loop
 
 ## Architecture
 
@@ -95,6 +114,7 @@ default:
 | Linear | `linear` | Create issues via GraphQL API |
 | SendGrid | `sendgrid` | Transactional emails via v3 Mail Send API |
 | Google Ads | `google_ads` | Offline click conversion upload |
+| Meta Conversions | `meta_conversions` | Batched server-side Pixel conversion events |
 | Staged Upload | `staged_upload` | Async bulk APIs: file upload → job trigger → poll |
 | Notion | `notion` | Append rows to Notion databases |
 | Twilio SMS | `twilio` | Send SMS per row via Twilio Messages API |
@@ -126,6 +146,7 @@ drt run --limit 10                # sampled run (#774): extract at most N rows; 
 drt run --fail-fast               # stop scheduling after first failure (#775); remaining syncs report status=skipped; also on drt test
 drt run --threads 4               # parallel sync execution
 drt run --cursor-value '2026-01-01 00:00:00'  # override watermark cursor for backfill
+# drt run also writes target/drt/run_results.json (#778) -- dbt run_results.json-style durable per-invocation record, independent of --output (written in text mode too), for every invocation that resolves a sync list (including no-op runs) -- NOT written for a preflight failure before syncs are known (bad project/profile/vars, --diff without --dry-run), matching dbt's own run_results.json. Reuses the same per-sync entries --output json's syncs array builds, minus raw error text (dropped, not redacted -- error_type/error_stage/error_suggestion stay). --target-path <dir> relocates it (default target/drt/, deliberately not dbt's own target/)
 drt test                          # run post-sync validation tests
 drt test --select <sync-name>     # test a specific sync
 drt test --store-failures         # sample up to N failing rows/failed test (#779); sync.mask applied
@@ -136,8 +157,9 @@ drt destinations                  # list available destination connectors
 drt status                        # show recent sync results
 drt status --output json          # JSON output for status
 drt mcp run                       # start MCP server (requires drt-core[mcp])
-drt serve --port 8080             # HTTP webhook endpoint — POST /sync/<name> answers 202 + run id (poll GET /runs/<id>, or ?wait=true for the result); same-sync triggers coalesce, different syncs run concurrently, nothing accepted is dropped (#854). Auth: --auth none|bearer|hmac, applied to every route except GET /health (GET /runs/<id> included; under hmac a GET signs the empty body)
-drt docs generate                 # static docs site to target/docs/ (html; also --format mermaid|json). Destination labels are docs-safe by default (#696): object identity (table/channel/sheet/bucket) stays, endpoints/hosts/phones/emails do not
+drt serve --port 8080             # HTTP webhook endpoint — POST /sync/<name> answers 202 + run id (poll GET /runs/<id>, or ?wait=true for the result); same-sync triggers coalesce, different syncs run concurrently, nothing accepted is dropped (#854). Auth: --auth none|bearer|hmac|oidc, applied to every route except GET /health (GET /runs/<id> included; under hmac a POST signs its raw body while a GET signs the request path under a derived key, so a signature is bound to one run id and cannot be replayed as a POST, #936)
+drt serve --auth oidc --oidc-audience <aud> --oidc-email <email>  # OIDC JWT verification for Pub/Sub push (#903) — needs drt-core[serve-oidc]; verifies signature against Google's rotating public keys, requires email_verified:true for --oidc-email, fails closed (401) if the extra isn't installed. Google-specific: no --oidc-issuer override, since verify_oauth2_token only ever fetches Google's own certs
+drt docs generate                 # static docs site to target/docs/ (html; also --format mermaid|json|dbt-exposures). dbt-exposures prints deterministic ref()-only dbt exposure YAML to stdout (#781). Destination labels are docs-safe by default (#696): object identity (table/channel/sheet/bucket) stays, endpoints/hosts/phones/emails do not
 drt docs generate --full-labels   # verbatim describe() labels + unredacted error text — trusted/internal hosting only (#696/#698)
 drt docs generate --history-depth 20  # recent runs per sync embedded in the manifest from .drt/history (schema v2, #698; default 10, 0 disables, --no-state omits)
 drt docs generate --inline        # html only: emit the whole catalog as ONE self-contained navigable HTML object — inlined CSS/JS + in-page (#hash) navigation (Elementary single-file model), zero sub-resource AND zero inter-object requests — so it renders and navigates on an authenticated object store (GCS storage.cloud.google.com / S3 presigned URLs) where per-object auth breaks the multi-file output's assets and cross-links (#818/#821). Display byte-identical to the default; default output stays multi-file
@@ -198,6 +220,19 @@ specs = build_drt_asset_specs(project_dir=".")
 # Use specs with @multi_asset + PipesClient
 ```
 
+The v0.4 API also includes:
+
+- `build_drt_change_sensor()` for event-driven runs from metadata-only Delta
+  Lake, Iceberg, Snowflake, or SQL Server change signals. Snowflake requires
+  both `watch_table=` and an explicit `minimum_interval_seconds=`; SQL Server
+  requires `watch_table=` to validate table-level Change Tracking.
+- Plain `@op` execution through `DagsterDrtResource.run(context=...,
+  sync_names=[...])`, which emits asset materializations without requiring an
+  `@drt_assets` definition.
+- `DrtEventIterator`, returned by `run()`, with chainable
+  `.fetch_row_count()` source-side verification.
+- `DrtSyncComponent` for declarative `defs.yaml` assets and `dg scaffold defs`.
+
 ## AI Skills for Claude Code
 
 Four skills available via the Claude Code plugin marketplace:
@@ -248,7 +283,7 @@ Slash command versions also available in `.claude/commands/` for manual installa
 - Set `sync.mode: mirror`
 - `destination.upsert_key` is **required** (used to identify which rows to DELETE)
 - Supported destinations: Postgres (#596), MySQL (#597), ClickHouse (#598, via `ALTER TABLE ... DELETE` mutation), Snowflake (#599), Databricks (v0.7.9).
-- **`sync.mirror` tuning (v0.7.10, Postgres / MySQL only):** `strategy: tracked` (#686) deletes only rows drt itself previously synced — state kept per sync in a drt-managed `_drt_synced_keys` table in the destination; first run baselines without deleting, lost state re-baselines with a WARN. Safe when the application also writes to the table. `scope: [parent_id]` (#687) restricts deletes to rows whose scope-column values appeared in this run's source (stateless fit for parent+child regeneration). Not combinable yet; other destinations reject both with a clear error.
+- **`sync.mirror` tuning (v0.7.10; expanded v0.8.4 — Postgres, MySQL, Snowflake, ClickHouse, Databricks):** `strategy: tracked` (#686) deletes only rows drt itself previously synced — state kept per sync in a drt-managed `_drt_synced_keys` table in the destination; first run baselines without deleting, lost state re-baselines with a WARN. Safe when the application also writes to the table. `scope: [parent_id]` (#687) restricts deletes to rows whose scope-column values appeared in this run's source (stateless fit for parent+child regeneration). Tracked strategy and scope can be combined on all five mirror destinations.
 - Safety: if the source produces no batches with records, the DELETE is skipped — a transient empty source can't wipe the destination
 - Memory-bound to source key cardinality; for tables larger than a few million rows, the temp-table strategy is a planned follow-up
 
