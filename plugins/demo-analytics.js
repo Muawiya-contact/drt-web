@@ -3,6 +3,7 @@ const path = require('path');
 
 const CONSENT_STORAGE_KEY = 'drt-analytics-consent';
 const SCRIPT_FILENAME = 'drt-analytics.js';
+const INSTRUMENTATION_TAG = /<script\b[^>]*\bdata-drt-demo-analytics(?=[\s=/>])/i;
 
 function demoAnalyticsAssetUrl(baseUrl) {
   const prefix = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
@@ -18,7 +19,7 @@ function escapeHtmlAttribute(value) {
 }
 
 function injectAnalytics(html, assetUrl, measurementId) {
-  if (html.includes('data-drt-demo-analytics')) {
+  if (INSTRUMENTATION_TAG.test(html)) {
     return html;
   }
 

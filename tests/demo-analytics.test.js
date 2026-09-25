@@ -49,3 +49,15 @@ test('leaves a page that was already instrumented unchanged', () => {
     page,
   );
 });
+
+test('does not mistake documentation text for an injected analytics script', () => {
+  const page = '<html><head></head><body><code>data-drt-demo-analytics</code></body></html>';
+  const instrumented = demoAnalyticsPlugin.injectAnalytics(
+    page,
+    '/drt-web/demo/docs/assets/drt-analytics.js',
+    'G-TEST',
+  );
+
+  assert.match(instrumented, /<script data-drt-demo-analytics /);
+  assert.match(instrumented, /<code>data-drt-demo-analytics<\/code>/);
+});
