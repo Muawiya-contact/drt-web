@@ -127,7 +127,21 @@ Safety guards:
 
 Memory constraint: the in-process key set is memory-bound to source key cardinality. Mirror as shipped today is appropriate for small/medium reference tables.
 
-Same `sync.mode: mirror` is supported on **Postgres** (Step 1), **MySQL** (Step 2), and **Snowflake** (Step 4). BigQuery follows once contributor PR [#584](https://github.com/drt-hub/drt/pull/584) lands.
+Same `sync.mode: mirror` is supported on **Postgres**, **MySQL**, **Snowflake**, and **Databricks**.
+
+**Diff mirror (`mirror.strategy: diff`, [#1110](https://github.com/drt-hub/drt/issues/1110)/[#1177](https://github.com/drt-hub/drt/issues/1177)) — delete only source-snapshot removals:**
+
+```yaml
+sync:
+  mode: mirror
+  incremental_strategy: diff
+  mirror:
+    strategy: diff
+```
+
+This composes mirror deletion with source-side snapshot diff: added and changed rows follow the normal ClickHouse INSERT path, while `finalize_sync` deletes exactly the keys classified as removed. The DELETE reuses the synchronous mutation above with `IN {keys:Array(String)}` for a single key or `IN {keys:Array(Tuple(String, ...))}` for a composite key. A removal-only run still executes the mutation even though no records were loaded in that run; an empty removed-key list issues no mutation. `--dry-run --diff` previews the same removed-key list without scanning ClickHouse.
+
+Like the Postgres, MySQL, and Snowflake implementations, `strategy: diff` does not accept `mirror.scope`: the source snapshot comparison has already produced an exact row-level removal set, so there is no destination-side delete set left to narrow.
 
 **Tracked mirror (`mirror.strategy: tracked`, [#686](https://github.com/drt-hub/drt/issues/686)/[#692](https://github.com/drt-hub/drt/issues/692)) — for tables the application also writes to:**
 
@@ -146,6 +160,8 @@ Two ClickHouse-specific notes:
 - **No cross-statement transaction.** The other three dialects commit the target DELETE and the state rewrite together; ClickHouse mutations and inserts here are each their own statement. The target DELETE always runs *first*, so a failure partway through degrades safely — either a stale key gets deleted again next run (a harmless no-op) or the state table reads back empty and the existing "no prior state" baseline path takes over (WARN, re-baseline, no wrongful deletes) rather than ever deleting something it shouldn't.
 
 **Scoped mirror (`mirror.scope`, [#687](https://github.com/drt-hub/drt/issues/687)/[#692](https://github.com/drt-hub/drt/issues/692)):** `scope: [parent_id]` restricts the mirror DELETE to rows whose scope values appeared in this run's source — the fit for 1:N regeneration. Composable with `strategy: tracked` ([#694](https://github.com/drt-hub/drt/issues/694)) provided `scope` is a subset of `upsert_key`. See the [Postgres scoped-mirror section](postgres.md) for the full semantics — identical on ClickHouse, built on the same `{name:Type}`-parameterized mutation shape already used for the plain mirror DELETE above.
+
+One divergence from that shared write-up ([#890](https://github.com/drt-hub/drt/issues/890)/[#906](https://github.com/drt-hub/drt/issues/906)): on Postgres/MySQL/Snowflake, tracked+scoped keys written before this SQL-side narrowing existed are healed lazily — a later run backfills the missing scope value at the cost of one plain `UPDATE`, since the row is already fetched and decoded for the diff. ClickHouse's equivalent, `ALTER TABLE ... UPDATE`, is a mutation that rewrites parts rather than a cheap per-row write, so drt does not do this automatically here. Those older keys keep falling through to the Python-side filter — still correct, just not narrowed in SQL — until an operator clears the sync's rows from `_drt_synced_keys` and lets the next run re-baseline (the first run after a re-baseline deletes nothing). Keys tracked after the upgrade get the full SQL-side narrowing from the start.
 
 ## Identifier quoting
 

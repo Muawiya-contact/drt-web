@@ -14,6 +14,24 @@ profile: default          # optional, default: "default" — maps to ~/.drt/prof
 history:                  # optional: sync execution history (#276)
   enabled: true           # default: true — set to false to disable history altogether
   retention_days: 30      # default: 30 — entries older than this are pruned on each append
+  max_entries: 500        # default: 500 — remote backends cap entries per sync; local ignores it
+state:                    # optional: persistence backend (#756, #920); see docs/guides/remote-state.md
+  backend: local          # default: local; gcs, s3, and warehouse are available
+  # backend: gcs required fields: bucket. optional: prefix.
+  # backend: s3 required fields: bucket. optional: prefix, region, aws_profile,
+  #   aws_access_key_id_env, aws_secret_access_key_env, aws_session_token_env,
+  #   endpoint_url (S3-compatible endpoints — MinIO, R2, etc.).
+  # backend: warehouse required fields: connection_profile (names a profiles.yml
+  #   entry — Postgres, Snowflake, Databricks, or BigQuery). See
+  #   docs/guides/warehouse-state.md.
+  # Every field above is rejected when backend is local; bucket is required
+  # for both gcs and s3, the six S3-only fields are rejected under gcs, and
+  # connection_profile is only valid under warehouse.
+  idempotency: false      # optional (#1099), warehouse + Postgres only; per-record ledger
+  audit_trail:            # optional (#1100), warehouse + Postgres only
+    enabled: false
+    retain_days: 30       # required and > 0 when enabled
+    fields: [customer_id] # required/non-empty when enabled; destination-facing, post-mask fields
 vars:                     # optional: project vars (#783) — reviewed, in-repo defaults
   lookback_days: 7        # referenced as {{ var('lookback_days') }}
   hubspot_pipeline: default
@@ -23,8 +41,9 @@ query_tagging:            # optional: cost-attribution query tagging (#768)
     team: growth
 ```
 
-History is stored under `.drt/history/<sync_name>.jsonl` (one file per sync, JSONL format).
+With the local backend, history is stored under `.drt/history/<sync_name>.jsonl` (one file per sync, JSONL format).
 Inspect via `drt status --history` or the `drt_get_history` MCP tool.
+State backend selection is documented in `docs/guides/remote-state.md`; it is independent of `sync.watermark.storage`.
 
 ### Query tagging (#768)
 
@@ -135,6 +154,23 @@ api_users:
     start_param: updated_since  # request param that receives the last watermark value
 ```
 
+### Managed bookkeeping schema (#960)
+
+Postgres, Snowflake, Databricks, and BigQuery profiles accept
+`managed_schema: _drt` (the default). It names drt's own schema/dataset for
+snapshot-diff baselines and warehouse-backed state tables; it is not the
+default schema for `model:` queries. The location is inside the Postgres
+database, Snowflake database, Databricks catalog, or BigQuery project from the
+same profile. drt can create the schema/tables, or an administrator can
+pre-provision them and grant only the documented table-level permissions.
+
+```yaml
+warehouse_source:
+  type: snowflake             # also postgres | databricks | bigquery
+  # ... normal connection fields ...
+  managed_schema: _drt
+```
+
 ---
 
 ## `.drt/secrets.toml` (optional)
@@ -142,6 +178,12 @@ api_users:
 Local secret store for development. Gitignored by default.
 
 Resolution order: explicit YAML value > environment variable > secrets.toml
+> provider URI
+
+`secrets.toml` can be stored as `secrets.toml.enc` using age encryption. When
+the encrypted file exists, drt decrypts it in memory with `DRT_SECRETS_KEY` and
+gives it precedence over plaintext. See
+[`docs/guides/secrets-encryption.md`](../guides/secrets-encryption.md).
 
 ```toml
 [destinations.mysql]
@@ -157,6 +199,27 @@ SNOWFLAKE_PASSWORD = "dev-password"
 SNOWFLAKE_PRIVATE_KEY = """-----BEGIN PRIVATE KEY-----
 ..."""
 ```
+
+---
+
+## Secret provider URIs (#782)
+
+Any `*_env` field can be a `scheme://...` URI instead of a plain env var
+name — tried last in the resolution order above, once explicit/env/toml
+have all come back empty:
+
+```yaml
+password_env: "aws-sm://prod/drt/snowflake#password"
+```
+
+| Scheme | Extra | Example |
+|---|---|---|
+| `aws-sm://` | `drt-core[aws-secrets]` | `aws-sm://prod/drt/snowflake#password` |
+| `gcp-sm://` | `drt-core[gcp-secrets]` | `gcp-sm://projects/p/secrets/drt-sf/versions/latest#password` |
+| `vault://` | `drt-core[vault]` | `vault://secret/data/drt/snowflake#password` (`#key` required) |
+
+See [Secret Provider URIs](../guides/secret-provider-uris.md) for IAM/policy
+snippets, the caching behaviour, and `drt serve`-specific caveats.
 
 ---
 
@@ -177,6 +240,31 @@ Raises an error if the variable is not set. Supported since v0.6.1 for all strin
 
 ---
 
+## State-aware selection and run artifacts
+
+`state:modified` and `state:new` compare current sync files (and a referenced
+local model SQL file) with `syncs[].config_hash` in a schema-v3 manifest:
+
+```bash
+drt docs generate --format json --output ci-baseline
+drt run --select state:modified --state ci-baseline/manifest.json --dry-run --diff
+```
+
+The selectors also work with `drt build`, `drt test`, and `drt validate`.
+`--state` is required; a missing/unreadable baseline fails open by selecting
+all current syncs, while a readable schema-v1/v2 manifest fails with a request
+to regenerate it. Environment/profile/project-var value changes are not part
+of the per-sync file hash.
+
+Every `drt run` that resolves a sync list writes
+`target/drt/run_results.json`, independent of console `--output`. Use
+`--target-path <dir>` to relocate it. The artifact wraps the same per-sync
+result entries in `{schema_version, invocation, results}` and omits raw
+exception text; it is not written for a preflight failure before sync
+selection succeeds. `drt test` and `drt build` do not write this artifact.
+
+---
+
 ## `syncs/<name>.yml` — Full Schema
 
 ```yaml
@@ -189,11 +277,18 @@ destination:                # required: see Destination Configs below
   # ... destination-specific fields
 
 sync:                       # optional: all fields have defaults
-  mode: full                # "full" (default) | "incremental" | "upsert" | "replace" | "mirror"  # "upsert" is alias for "full" when upsert_key is set; "replace" does TRUNCATE + INSERT; "mirror" upserts then DELETEs destination rows whose upsert_key was not in the source (#340 — Postgres / MySQL / ClickHouse / Snowflake)
-  match_policy: upsert      # optional (#757): "upsert" (default) | "update_only" (only touch rows that already exist — no-match rows are SKIPPED, counted in SyncResult.skipped with a skipped_no_match breakdown; `drt run` prints "N skipped (M no match)" and --output json adds rows_skipped / rows_skipped_no_match) | "create_only" (only insert rows that don't exist — existing rows untouched). Applies to the upsert write path (mode: full/upsert/incremental); rejected for replace/mirror; fails fast on destinations that don't implement it. Postgres + HubSpot (create/update via POST-409 / PATCH-404); MySQL / other SaaS destinations follow per-PR
+  mode: full                # "full" (default) | "incremental" | "upsert" | "replace" | "mirror". replace/mirror: Postgres, MySQL, ClickHouse, Snowflake, Databricks, BigQuery
+  replace_strategy: truncate # "truncate" (default) | "swap"; only valid with mode: replace
+  match_policy: upsert      # optional (#757): "upsert" (default) | "update_only" (only touch rows that already exist — no-match rows are SKIPPED, counted in SyncResult.skipped with a skipped_no_match breakdown; `drt run` prints "N skipped (M no match)" and --output json adds rows_skipped / rows_skipped_no_match) | "create_only" (only insert rows that don't exist — existing rows untouched). Applies to the upsert write path (mode: full/upsert/incremental); rejected for replace/mirror; fails fast on destinations that don't implement it. Postgres + MySQL + HubSpot + Intercom; other SaaS destinations follow per-PR
+  write_policy: overwrite  # optional (#1238): "overwrite" (default) | "fill_empty"; fill only NULL/blank destination values, new rows in full; rejected for replace
+  write_policy_overrides:  # optional: exact destination column/property name -> policy
+    lifecycle_stage: overwrite
   mirror:                   # optional (#686): mirror-mode delete behaviour — only valid with mode: mirror
-    strategy: destination   # "destination" (default, #340: diff against the whole destination table — requires drt to own the table) | "tracked" (#686: only DELETE rows drt itself synced, tracked per sync in a drt-managed _drt_synced_keys table in the destination; safe when the application also writes to the table. First run baselines without deleting; lost state re-baselines with a WARN. Postgres / MySQL only for now)
-    scope: [parent_id]      # optional (#687): restrict destination-strategy deletes to rows whose scope-column values appeared in this run's source — the stateless fit for 1:N regeneration (parent + child link rows). Rows under unobserved parents are never touched. Not combinable with strategy: tracked yet. Postgres / MySQL only for now
+    strategy: destination   # "destination" (default: compare with whole target) | "tracked" (delete only drt-owned keys; unsupported on BigQuery) | "diff" (delete exact source-snapshot removals)
+    scope: [parent_id]      # optional: restrict deletes to observed scope values. Works with destination/tracked; tracked+scope on Postgres/MySQL/Snowflake/ClickHouse/Databricks. Rejected with strategy: diff
+  incremental_strategy: cursor # "cursor" (default) | "diff" (#755). diff requires mode: upsert|mirror, no cursor_field, a destination upsert_key, and a Postgres/Snowflake/Databricks/BigQuery source
+  diff:                     # only with incremental_strategy: diff; omitted means hash_columns: all
+    hash_columns: all       # "all" or a non-empty list; key columns are excluded from all
   cursor_field: updated_at  # required when mode=incremental — column name for watermark
   watermark:                # optional: remote watermark storage for stateless environments
     storage: local          # "local" (default) | "gcs" | "bigquery"
@@ -205,13 +300,37 @@ sync:                       # optional: all fields have defaults
     lag: "1 hour"           # optional (#759): overlap window — re-read this far behind the stored watermark to catch late-arriving rows. Duration string for timestamp cursors ("1 hour", same grammar as freshness.max_age) or positive int for numeric cursors. Storage-sourced watermarks only (never --cursor-value / default_value); the persisted watermark is never lagged. Overlap rows are RE-SENT each run — destination must tolerate duplicates (upsert_key)
   batch_size: 100           # default: 100 — rows per destination call
   on_error: fail            # "fail" (default) | "skip"
+  computed_fields:          # optional (#763): declarative derived columns {field_name: jinja_template}
+    full_name: "{{ row.first_name }} {{ row.last_name }}"   # reads SOURCE column names, like cursor_field / lookups
+    signup_ms: "{{ (row.signup_ts.timestamp() * 1000) | int }}"
+    source_system: "drt-${ENV}"          # constants and ${VAR} substitution both work
+    # transform order: computed_fields -> field_mappings -> mask -> metadata_columns. A SINGLE-EXPRESSION template keeps the
+    # Python value's type ({{ row.n * 1000 }} -> 5000, not "5000"); anything with surrounding text renders
+    # as a string. A computed field can never read another (order-independent, like field_mappings).
+    # Writing an existing column name replaces it in place and reads the ORIGINAL value (phone -> E.164).
+    # Same Jinja env / filters / StrictUndefined as body_template. Syntax is validated at config load;
+    # a missing column is a run-time error under on_error (skip = drop the row, fail = stop and name the field).
+    # WARNING: a null passed THROUGH a filter renders as the string "None" (Jinja stringifies before
+    # filtering) — write {{ (row.phone or '') | replace('-','') }} (parens matter: | binds tighter than
+    # or, so an unparenthesized fallback only applies the filter to '', not to a non-null row.phone).
+    # A bare {{ row.phone }} stays null.
   field_mappings:           # optional (#415): declarative column rename {source_column: destination_field}
-    user_id: id             # applied after extraction + cursor tracking + lookups, just before the destination
-    full_name: name         # cursor_field / lookups use SOURCE names; upsert_key / destination columns use MAPPED names
+    user_id: id             # applied after extraction + cursor tracking + lookups + computed_fields
+    full_name: name         # cursor_field / lookups / computed_fields use SOURCE names; upsert_key / destination columns use MAPPED names
   mask:                     # optional (#427/#660): PII masking — obscure fields before they reach the destination
     email: hash             # "hash" (SHA-256 hex) | "redact" ("[REDACTED]"); keys reference the DESTINATION-facing name (post field_mappings)
     name: { strategy: truncate, length: 2 }  # object form for parameterised strategies (truncate keeps the first N chars)
-    # runs as the LAST transform (after field_mappings); nulls pass through; works on every destination; source SQL untouched
+    # runs as the last SOURCE-DATA transform (after computed_fields and field_mappings); nulls pass through; works on every destination; source SQL untouched
+  metadata_columns:         # optional (#762): opt-in engine-injected bookkeeping columns {synced_at, run_id, sync_name}
+    synced_at: _drt_synced_at  # UTC run-start timestamp, ISO 8601 — one value per run_sync() call, shared by every row it writes
+    run_id: _drt_run_id        # CLI-invocation-level id; null for library callers of run_sync() that pass none
+    sync_name: _drt_sync_name  # the sync's own name — off by default even when the other two are set
+    # runs LAST of every transform (after mask) — column names here are already destination-facing (chosen
+    # directly, not derived), and values are engine bookkeeping, not source data, so nothing to rename/mask.
+    # Target column must already exist on the destination (dict enrichment, not DDL). Flows to every
+    # destination that takes a list[dict], including file/blob. A DLQ'd record's columns reflect the
+    # ORIGINAL failed attempt — drt retry resends the stored record verbatim, values are not refreshed.
+  idempotency_key: "{{ row.id }}" # optional (#1099): per-record key for state.idempotency's Postgres warehouse ledger; defaults to destination upsert_key when available
   dlq:                      # optional (#278): Dead Letter Queue — persist per-record load failures for replay
     enabled: false          # default: false (opt-in) — writes FULL records to .drt/dlq/<sync>.jsonl (a PII decision)
     max_records: 10000      # default: 10000 — cap queue size; oldest entries dropped past this (0 = unbounded)
@@ -281,6 +400,119 @@ tests:                      # optional: post-sync validation (DB destinations on
     severity: warn                    # optional on every type: "warn" | "error" (default)
 ```
 
+### Write policy (`sync.write_policy`, #1238)
+
+`write_policy: fill_empty` writes a column only when the destination's value is
+NULL, an empty string or only spaces; an existing value is never replaced (new rows
+are inserted in full). `write_policy_overrides` sets one column the other way. A
+non-text column is empty only when NULL; a stored `0` is a value. Supported on
+**PostgreSQL and MySQL** (upsert and `update_only`), **Snowflake** (the upsert
+`MERGE` path, including mirror), and **Databricks** (the staging-sourced Delta
+`MERGE`, composed with sparse-row presence flags, including mirror), and
+**BigQuery** (each typed-temp-table sparse `MERGE`, including mirror), and
+**HubSpot** (fail-closed batch read of ≤100 IDs, then filtered PATCH; new records
+POSTed in full). Snowflake, Databricks, and BigQuery do not support `update_only`;
+HubSpot does. Other destinations fail fast. The three warehouse destinations
+require destination `mode: merge` for an ordinary upsert
+(`sync.mode: mirror` forces it); `mode: insert` is refused rather than silently
+ignoring the policy. Databricks and BigQuery semi-structured columns are empty
+only when SQL NULL. BigQuery determines text columns from the target schema. If
+the target table does not exist (`NotFound`), it uses NULL-only semantics because
+there is no schema yet; any other schema lookup failure fails the batch.
+Duplicate source keys that match one target row can make Databricks or BigQuery
+reject the ambiguous `MERGE`. Destination diff/plan applies `fill_empty`, validates
+source override names, counts `kept_values`, and models repeated keys as
+first-writer-wins only for PostgreSQL, MySQL, Snowflake, and Databricks. HubSpot
+models repeated IDs first-writer-wins in its live read/filter path and reports
+exact kept-property counts in `SyncResult.kept_values`. BigQuery and HubSpot are
+not queryable destinations, so `drt plan` and `--dry-run --diff` report them as
+unsupported and do none of those preview operations (HubSpot API-backed diff is
+tracked by #472).
+Rejected for `mode: replace`. A name in `write_policy_overrides` that is not a
+column of the destination table is an error (nothing written; needs introspection),
+and supported plan/diff destinations report it as unavailable when the source does
+not produce it. HubSpot instead validates exact, case-sensitive override names
+once against its properties API when the token has schema access; 401/403/404,
+unusable responses, transport failures, and exhausted 5xx retries skip this
+best-effort validation with a warning.
+
+```yaml
+sync:
+  mode: upsert
+  write_policy: fill_empty
+  write_policy_overrides:
+    lifecycle_stage: overwrite
+```
+
+### Change guards (`sync.guards`, #1218)
+
+Limits on how much one run may change. They are evaluated against the change set
+`drt plan` computes: `drt plan` reports a trip (exit code unchanged) and
+`drt apply` refuses to write (`--force-guards` overrides and is recorded in
+`run_results.json`). `drt run` does not enforce them yet. Unknown keys are
+rejected, so a typo cannot silently disable a guard.
+
+```yaml
+sync:
+  mode: mirror
+  guards:
+    max_creates: 10000     # rows to create (incl. append-only inserts)
+    max_deletes: 500       # rows to delete (mirror / replace)
+    max_delete_pct: 10     # deletes as % of the rows the delete pass looked at
+    max_updates_pct: 50    # updates as % of source rows
+```
+
+A percentage that cannot be evaluated (a delete strategy that does not report
+how many rows it looked at, such as `strategy: diff`) trips the guard instead of
+passing; use `max_deletes` there.
+
+### Snapshot-diff incremental and diff mirror (#755/#1110)
+
+`incremental_strategy: diff` is for curated models that have no reliable
+watermark column. Postgres, Snowflake, Databricks, and BigQuery sources
+materialize the full query result under the profile's `managed_schema` and
+classify added, changed, and removed rows with server-side joins on
+`destination.upsert_key`. Added/changed rows take the normal upsert path.
+
+```yaml
+destination:
+  type: bigquery
+  project: target-project
+  dataset: serving
+  table: customers
+  mode: merge
+  upsert_key: [id]
+
+sync:
+  mode: mirror
+  incremental_strategy: diff
+  diff:
+    hash_columns: [email, plan]  # or all (default)
+  mirror:
+    strategy: diff
+```
+
+The source baseline advances only after a successful, non-dry-run,
+**unlimited** delivery. `--limit` sends a prefix without promoting the full
+snapshot, so skipped rows remain eligible on the next run. Same-sync overlap
+is unsupported (best-effort replacement detection exists, but it is not a
+lock). This strategy requires source-warehouse create/write/drop privileges;
+cursor incremental remains the read-only alternative.
+
+`mirror.strategy: diff` consumes only the exact removed-key set and works on
+Postgres, MySQL, Snowflake, ClickHouse, Databricks, and BigQuery destinations.
+It requires `incremental_strategy: diff` and rejects `mirror.scope`.
+
+### Dry-run diff: omission semantics (#1138)
+
+`drt run --dry-run --diff` preserves the distinction between a missing field
+and an explicit `null`. For an upsert/partial update, an omitted destination
+column is left untouched; replace mode reports the column as `<default>`
+because the rebuilt row receives the target's declared default; append-only
+writes are labelled INSERT. JSON output carries the same action/field
+semantics. Mirror previews also report the destination-key scan, including a
+completed scan that found no deletions and a scan that was unavailable.
+
 ### `query` — custom SQL tests (#779)
 
 Escape hatch for anything the five fixed types can't express. `{{ table }}` renders to the
@@ -308,6 +540,56 @@ debugging **snapshot of the current run** — each run overwrites the file, and 
 passes has its stale sample removed). **`sync.mask` (#427) is applied before anything is
 written** — masked columns are masked in the failure file, never the raw value. `row_count` has
 no per-row failure concept, so nothing is written for it. Off by default.
+
+---
+
+## `unit_tests` — offline transform-pipeline tests (#780)
+
+A sibling of `tests:` at the top level of a sync file, not nested under it — `tests:` queries the
+**destination** after a real sync; `unit_tests:` never touches a destination at all.
+
+```yaml
+name: users_to_hubspot
+model: ref('users')
+destination: { type: hubspot, api_key_env: HUBSPOT_KEY, object_type: contacts }
+
+sync:
+  field_mappings: { first: given_name }
+  mask: { email: hash }
+
+unit_tests:                                   # optional: offline transform-pipeline tests
+  - name: masks_email_and_renames             # required: label, shown in output
+    given:                                    # required: fixture rows (>= 1), source column names
+      - { id: 1, email: "alice@example.com", first: "Alice", last: "Doe" }
+    expect:                                   # required: expected rows (>= 1), destination-facing names
+      - { id: 1, given_name: "Alice" }        # subset match — undeclared keys in the real
+                                               # output are ignored (see below)
+```
+
+```bash
+drt test --unit                          # text
+drt test --unit --output json            # json
+drt test --unit --select users_to_hubspot --fail-fast
+```
+
+**What it runs.** `given` rows are pushed through the *real* engine transform chain —
+`field_mappings` → `mask` (and any other stage the engine applies before `destination.load()`) —
+via a fake source and a capturing destination, so `given` uses **source** column names (the same
+names `cursor_field` and `lookups` read) and `expect` uses **destination-facing** names
+(post-rename, post-mask). No network call, no credential, no destination connection.
+
+**`expect` is a subset match per row**, not exact-record equality — only the keys a test declares
+are checked, so a sync's source columns growing later doesn't break every existing unit test. Row
+**count** is still checked exactly: a transform that drops or duplicates a row is exactly what a
+unit test exists to catch.
+
+**Not supported yet:** a sync whose destination has `lookups:` configured — lookups resolve
+against the real destination, and there is no fake for that. `drt test --unit` reports it as a
+failed test (not a crash) naming the reason. Mutually exclusive with `--dry-run` and
+`--store-failures`, which are destination-connected concepts unit tests don't have.
+
+Prior art: dbt unit tests (`given` / `expect` YAML, no live data); Census / Hightouch mapper
+previews with sample records.
 
 ---
 
@@ -537,7 +819,33 @@ destination:
   auth:                                      # optional — see Auth Configs
     type: bearer
     token_env: MY_API_TOKEN
+  native_idempotency_key: "{{ sync_name }}:{{ row.id }}" # optional (#897), record mode
+  native_idempotency_header: Idempotency-Key # default; change for APIs using another header
 ```
+
+`body_mode` (#770) — send N records per request instead of one-request-per-row, for bulk endpoints:
+
+```yaml
+destination:
+  type: rest_api
+  url: "https://api.example.com/bulk"
+  body_mode: batch                           # default: record (one row per request)
+  max_records_per_request: 100               # optional — splits the engine's sync.batch_size chunk further
+  batch_template: |                          # required when body_mode: batch — rows=<post-mapping records>
+    {"records": {{ rows | tojson_safe }}}
+  error_path: "results"                      # optional dotted path to an index-aligned response list;
+                                              # null = success, non-null = that row's error (skip/fail per on_error)
+  native_idempotency_key: "{{ sync_name }}:{{ request_id }}" # batch mode: row is unavailable; request_id is stable across retries of one HTTP chunk
+```
+Rate limiting is charged once per outer request in batch mode (a request now buys N records of throughput);
+`on_error: fail` stops after the first sub-chunk containing any failure. See `docs/connectors/rest-api.md`.
+
+`native_idempotency_key` is rendered once before drt's retry loop and sent in
+`native_idempotency_header`. It protects against an ambiguous HTTP response
+only when the receiving API actually deduplicates that header. Several other
+fire-and-forget destination configs accept the field only so `drt validate`
+can warn that their APIs offer no mechanism to wire it to; do not treat a
+warning-only field as retry protection.
 
 ### `type: slack`
 
@@ -628,6 +936,31 @@ destination:
     token_env: HUBSPOT_TOKEN      # Private App token with CRM write scope
 ```
 
+HubSpot supports `sync.write_policy: fill_empty` for `mode: full`, `upsert`, and
+`incremental`, including `write_policy_overrides` and every `match_policy`. It
+performs one rate-limited, retried batch read per ≤100 rendered records. A 207 is
+accepted only when absent results have `OBJECT_NOT_FOUND` errors whose non-empty
+ID lists contain only requested inputs; one error may group multiple IDs. Any
+other error, status absent or not exactly `COMPLETE`, or missing/malformed
+`results` fails the group closed. Batch read and PATCH-by-`idProperty` require a
+unique-valued property or `hs_object_id`; a non-unique property such as
+`dealname` produces row errors and no writes. Existing non-empty fill-only
+properties are omitted from PATCH, while
+new records are POSTed in full; a POST-409 create race is a row error that asks
+the operator to re-run, never an unfiltered PATCH.
+
+Property names are lowercase and case-sensitive. Override names are checked once
+per object type and resolved token through the properties API when accessible,
+and validation is skipped with a warning otherwise. Duplicate IDs within one
+load are first-writer-wins; across engine batches they rely on the next read
+seeing the previous write, so a small stale window is possible. Rate limiting
+counts logical operations, not internal
+retries or the default-policy POST-409-to-PATCH fallback. A row with nothing to
+write beyond `id_property` is skipped without incrementing `skipped_no_match`;
+the aggregated `SyncResult.kept_values` counts kept properties and `drt run`
+prints them. This leg is mock-verified only, not verified against a live HubSpot
+account. HubSpot has no `drt plan` / `--dry-run --diff` support today (#472).
+
 ### `type: zendesk`
 
 ```yaml
@@ -677,6 +1010,12 @@ destination:
 ```
 
 > `overwrite` clears the sheet then writes header + data rows. `append` adds data rows only.
+
+Google Sheets columns are positional. The first batch fixes the column set as
+the first-seen union of all keys in that batch; missing values become empty
+cells. A later batch that introduces a new column fails with `column mismatch`
+instead of silently dropping it. Increase `sync.batch_size` when sparse fields
+may first appear late.
 
 ### `type: postgres` (destination)
 
@@ -753,6 +1092,33 @@ destination:
   secure: false                        # true = HTTPS
   connection_string_env: CH_CONN       # alternative: full connection string
 ```
+
+### `type: bigquery` (destination)
+
+```yaml
+destination:
+  type: bigquery
+  project: my-gcp-project
+  dataset: serving
+  table: customer_scores
+  location: US                         # optional
+  method: application_default          # default; or keyfile
+  # keyfile: /path/to/service-account.json # only with method: keyfile
+  mode: merge                          # insert (default) | merge
+  upsert_key: [id]                     # required for merge and sync.mode: mirror
+
+sync:
+  mode: mirror                         # also supports replace
+  # replace_strategy: swap             # replace only: truncate (default) | swap
+  # mirror: {strategy: diff}           # requires incremental_strategy: diff
+```
+
+BigQuery `sync.mode: replace` uses load jobs; `replace_strategy: swap` builds a
+per-run shadow and atomically copies it over the target. Mirror forces MERGE,
+supports composite keys and `mirror.scope`, and stages observed keys for one
+end-of-sync anti-join delete. `mirror.strategy: tracked` is unsupported;
+`strategy: diff` stages only source-snapshot removals. The target table must
+already exist.
 
 ### `lookups` (DB destinations: postgres, mysql, clickhouse)
 
@@ -850,6 +1216,7 @@ For APIs that require file upload → job trigger → poll for completion
 destination:
   type: staged_upload
   format: csv                          # "csv" | "json" | "jsonl"
+  rate_limit_key: vendor-account-a     # optional stable, non-secret quota identity; public YAML alias for internal rate_limit_key_override
   stage:
     url: "https://upload.example.com/files"
     method: POST
@@ -879,6 +1246,11 @@ destination:
     interval_seconds: 30               # default: 30
     timeout_seconds: 3600              # default: 3600
 ```
+
+When `rate_limit_key` is unset, staged upload derives its limiter identity
+from the rendered poll hostname (or trigger hostname without polling). Set it
+when one vendor quota spans regional hosts or independent accounts share a
+host. Configs with the same explicit key share one limiter bucket.
 
 ---
 
@@ -932,11 +1304,59 @@ destination:
   conversion_value_field: revenue      # optional: row field for conversion value
   currency_code: JPY                   # default: USD
   developer_token_env: GOOGLE_ADS_DEVELOPER_TOKEN
+  native_idempotency_key: "{{ row.order_id }}" # optional: ClickConversion.orderId; a reused key is successful deduplication
+  cloud_project_id: "my-gcp-project"   # optional (#1157): the GCP project owning this config's OAuth client credentials -- the real rate-limit quota boundary under Google's Cloud-project-based access model; when unset, falls back to sharing a bucket per developer_token_env
   auth:
     type: oauth2_client_credentials
     token_url: "https://oauth2.googleapis.com/token"
     client_id_env: GOOGLE_ADS_CLIENT_ID
     client_secret_env: GOOGLE_ADS_CLIENT_SECRET
+```
+
+### `type: klaviyo` — safe historical events
+
+```yaml
+destination:
+  type: klaviyo
+  api_key_env: KLAVIYO_API_KEY
+  endpoint: event                       # profile (default) | event
+  email_field: email
+  metric_name_field: event_name         # or metric_name: Purchased
+  unique_id_field: event_id             # required for events; stable dedup id
+  time_field: occurred_at               # optional
+  value_field: amount                   # optional
+  backfill: true                        # event only: record history without firing live flows
+  revision: "2026-07-15"                # default and minimum when backfill=true
+```
+
+Use `backfill: true` for a first full event load or historical
+`--cursor-value` replay so Klaviyo still records metrics/segmentation events
+without re-triggering customer-facing automations. It is rejected for profile
+mode and with a revision older than `2026-07-15`; turn it back off for live
+incremental events.
+
+### `type: meta_conversions`
+
+```yaml
+destination:
+  type: meta_conversions
+  pixel_id: "123456789012345"          # required: Meta Pixel/data-source id
+  access_token_env: META_CONVERSIONS_ACCESS_TOKEN
+  api_version: v25.0                    # configurable Graph API version
+  action_source: website               # default: website
+  event_name: Purchase                  # exactly one of fixed/field name
+  # event_name_field: event_name
+  event_time_field: occurred_at         # required: Unix-seconds row field, real transaction time
+  event_id_field: event_id              # required: stable retry dedup id
+  event_source_url_field: page_url
+  email_field: email                    # normalized + SHA-256 → user_data.em[]
+  phone_field: phone                    # digits only + SHA-256 → user_data.ph[]
+  client_ip_address_field: client_ip    # plain text; never hashed
+  client_user_agent_field: user_agent   # plain text; never hashed
+  fbc_field: fbc                        # plain text; never hashed
+  fbp_field: fbp                        # plain text; never hashed
+  value_field: revenue
+  currency: USD
 ```
 
 ---

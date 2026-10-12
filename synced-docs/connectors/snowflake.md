@@ -91,11 +91,11 @@ destination:
   ...
 ```
 
-drt creates a session-scoped `TMP_<TABLE>` staging table (`CREATE TEMP TABLE TMP_<TABLE> LIKE <fully-qualified-table>`), INSERTs the batch's rows into the staging table, then issues a single `MERGE INTO <target> USING TMP_<TABLE> ON <upsert_key>` that updates matched rows and inserts unmatched ones. The staging table is dropped automatically at session end.
+drt issues `MERGE INTO <target> USING (SELECT ... FROM (VALUES ...) AS t(...)) ON <upsert_key>` — the batch's rows are inlined directly into the `MERGE`'s source, in chunks sized to stay under a verified-safe bind-parameter budget (no separate staging table since [#988](https://github.com/drt-hub/drt/issues/988); see that issue for the live-account measurements behind the chunk size). A chunk that fails outright falls back to one `MERGE` per row within it, so a single bad row doesn't take down the rest of its chunk.
 
 Requirements:
 - `upsert_key` columns identify a logical primary key — drt's `ON` clause uses them verbatim.
-- The destination user needs `CREATE TEMP TABLE`, `INSERT`, `UPDATE`, and `MERGE` privileges on the target schema.
+- The destination user needs `INSERT`, `UPDATE`, and `MERGE` privileges on the target schema — **no `CREATE TABLE` of any kind**, unlike before #988.
 
 ### Mirror mode (differential delete, [#340](https://github.com/drt-hub/drt/issues/340) Step 4 — v0.7.7+)
 
@@ -111,7 +111,7 @@ sync:
   mode: mirror
 ```
 
-Mirror **forces the MERGE write path regardless of `config.mode`** — mirror semantics intrinsically require upsert, so users only need to set `destination.upsert_key` and `sync.mode: mirror`. Each batch is staged + MERGEd into the target (same as `mode: merge`); at end-of-sync `finalize_sync` issues a single `DELETE FROM <database>.<schema>.<table> WHERE key NOT IN (collected)` that removes destination rows whose `upsert_key` was not observed in the source.
+Mirror **forces the MERGE write path regardless of `config.mode`** — mirror semantics intrinsically require upsert, so users only need to set `destination.upsert_key` and `sync.mode: mirror`. Each batch is MERGEd into the target (same as `mode: merge`); at end-of-sync `finalize_sync` issues a single `DELETE FROM <database>.<schema>.<table> WHERE key NOT IN (collected)` that removes destination rows whose `upsert_key` was not observed in the source.
 
 `finalize_sync` also drives the `replace_strategy: swap` atomic SWAP ([#434](https://github.com/drt-hub/drt/issues/434), see [Replace mode](#replace-mode-434)); for `insert` / `merge` / `truncate`-replace it returns `None` and the engine's existing dispatch is unchanged.
 
@@ -133,7 +133,7 @@ Comparison:
 Safety guards:
 
 - **Empty source short-circuit** — if no batch ever delivered records, the DELETE is skipped. A transient empty source (auth failure mid-extract, vendor outage) cannot wipe the destination.
-- **Failed rows excluded from the key set** — only successfully staged keys count as "observed source state"; a row that failed during the staging INSERT won't cause its destination counterpart to be deleted.
+- **Failed rows excluded from the key set** — only successfully merged keys count as "observed source state"; a row that failed to merge won't cause its destination counterpart to be deleted.
 - **`upsert_key` required at load time** — `load()` raises `ValueError` before any INSERT touches Snowflake when mirror mode is requested without a populated `upsert_key`. Fail-fast.
 - **Composite keys supported** — `upsert_key: [tenant_id, user_id]` produces `WHERE (tenant_id, user_id) NOT IN (...)`.
 
@@ -153,6 +153,8 @@ sync:
 Same Census-style semantics as Postgres/MySQL (see the [Postgres tracked-mirror section](postgres.md) for the full write-up): drt persists the set of `upsert_key` tuples it has itself synced in a drt-managed `<database>.<schema>._drt_synced_keys` table, and each run deletes only `previously-synced − current-source` keys — rows drt never wrote are never deletion candidates. First run baselines (WARN, no deletes); lost/missing state re-baselines the same way.
 
 The state table uses the same `sync_name` / `key_hash` / `key_json` shape as Postgres/MySQL, created lazily via `CREATE TABLE IF NOT EXISTS`, pre-provisioning-friendly the same way (`SHOW TABLES LIKE '_drt_synced_keys' IN SCHEMA <database>.<schema>` stands in for `to_regclass`/`information_schema.tables`, mirroring the existence check `_target_exists` already uses for the replace-swap path). No `PRIMARY KEY` enforcement gotcha to worry about here beyond the usual Snowflake caveat that primary keys are informational, not enforced — drt controls the INSERT/DELETE pairing itself and never relies on a uniqueness constraint to reject a duplicate.
+
+Tracked mirror's state-diff step uses a temporary staging table for a server-side diff when the role has schema-level `CREATE TABLE`; that privilege is optional there — a role limited to the target and pre-provisioned state tables transparently falls back to a client-side diff for that step, at the cost of reading that sync's tracked-key state into process memory ([#987](https://github.com/drt-hub/drt/issues/987)). The write path itself no longer needs `CREATE TABLE` either ([#988](https://github.com/drt-hub/drt/issues/988), see [Merge mode](#merge-mode-upsert) above) — `sync.mode: mirror`, tracked or not, is now genuinely no-DDL end to end on Snowflake for a role with only `INSERT`/`UPDATE`/`MERGE`/`DELETE` on the target and pre-provisioned state tables.
 
 **Scoped mirror (`mirror.scope`, [#687](https://github.com/drt-hub/drt/issues/687)/[#692](https://github.com/drt-hub/drt/issues/692)):** `scope: [parent_id]` restricts the mirror DELETE to rows whose scope values appeared in this run's source — the fit for 1:N regeneration. Composable with `strategy: tracked` ([#694](https://github.com/drt-hub/drt/issues/694)) provided `scope` is a subset of `upsert_key`. See the [Postgres scoped-mirror section](postgres.md) for the full semantics — identical on Snowflake, built on the same explicit-placeholder DELETE shape (single-column `IN (%s, %s, ...)` / composite `(c1, c2) IN ((%s, %s), ...)`) already used for the plain mirror DELETE above.
 
@@ -248,6 +250,67 @@ server-side until consumed. A slow destination therefore keeps a Snowflake sessi
 warehouse — busy for the duration, which is worth knowing if you are billing on warehouse uptime.
 Per [#766](https://github.com/drt-hub/drt/issues/766) a failure after the first row has been
 yielded is not retried.
+
+## As a source — diff-based incremental ([#1112](https://github.com/drt-hub/drt/issues/1112))
+
+Snowflake supports `sync.incremental_strategy: diff` for models without a reliable cursor column.
+Each run materializes the full model result in `_drt_snapshot_<sync_name>_<digest>` under the source
+profile's `managed_schema`, then classifies added, changed, and removed rows with server-side joins
+on `destination.upsert_key`. Added and changed rows follow the normal upsert path; removed keys are
+available in `SyncResult.diff_removed_keys`, power `mirror.strategy: diff`, and appear in
+`--dry-run --diff` deletion previews.
+
+```yaml
+# ~/.drt/profiles.yml
+sf:
+  type: snowflake
+  account: xy12345.us-east-1
+  user: analyst
+  private_key_env: SNOWFLAKE_PRIVATE_KEY
+  database: ANALYTICS
+  schema: PUBLIC
+  warehouse: COMPUTE_WH
+  managed_schema: _drt       # default; drt needs table create/drop here
+```
+
+```yaml
+destination:
+  type: snowflake
+  # ... connection fields ...
+  mode: merge
+  upsert_key: [id]
+
+sync:
+  mode: upsert               # or mirror
+  incremental_strategy: diff
+  diff:
+    hash_columns: all        # or an explicit non-empty column list
+```
+
+`hash_columns: all` hashes every model output column except the upsert key. An explicit list is
+validated against the actual output columns and a typo fails loudly. Snowflake's native typed
+`HASH(...)` is used directly, so `NULL` and an empty string are different changes without casting
+values through session-dependent text formats.
+
+The new snapshot becomes the baseline only after a non-dry-run sync completes with zero row
+failures. Existing baselines are promoted with Snowflake's atomic `ALTER TABLE ... SWAP WITH`;
+scratch is rebuilt with `CREATE OR REPLACE`, so an interrupted extract or a crash around promotion
+does not wedge the next run. Cursor incremental remains the read-only-source option: diff requires
+write/create/drop privileges in `managed_schema`, or an administrator can pre-create and grant the
+schema following the same managed-table escape hatch used by warehouse-backed state.
+
+Concurrent runs of the **same** diff sync are unsupported. Each scratch table is tagged with a
+per-run token in its Snowflake table comment; every classification stream checks the token before
+reading (and again after draining), and commit checks it immediately before `SWAP`/`RENAME` and on
+the promoted baseline afterward. If a second run has replaced the fixed-name scratch, the first
+run fails loudly instead of knowingly streaming or successfully reporting promotion of the second
+run's snapshot. Detection is deliberately best-effort: Snowflake DDL autocommits, so a narrow
+TOCTOU window remains between each token check and the following statement. drt does not hold a
+lock across extraction, destination writes, and commit because a row failure deliberately skips
+commit and could leak that lock in a long-running process. Use
+`drt serve` request coalescing ([#854](https://github.com/drt-hub/drt/issues/854)) or scheduler
+overlap protection. The concurrent-replacement detection is covered by a live `dwh-smoke` test
+(`test_snowflake_diff_incremental_smoke.py`) as well as unit tests.
 
 ## Notes
 

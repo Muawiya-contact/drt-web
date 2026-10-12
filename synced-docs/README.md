@@ -9,7 +9,7 @@
 
 ### The reverse leg of your data stack.
 
-dlt loads data in, dbt transforms it, and **drt** activates it back out — reverse ETL from your warehouse to the tools your team works in. Declarative YAML, one `drt run`.
+dlt loads data in, dbt transforms it, and **drt** activates it back out — reverse ETL from your warehouse to the tools your team works in, as YAML in your own repo. No dashboard to babysit, no audience builder duplicating what dbt already does, no hosted runtime billing you per row. Your data goes straight from your warehouse to the destination — never through a drt-hosted intermediary.
 
 <p align="center">
   <code>dlt</code> <sub>load</sub> &nbsp;→&nbsp; <code>dbt</code> <sub>transform</sub> &nbsp;→&nbsp; <b><code>drt</code></b> <sub>activate</sub>
@@ -23,7 +23,7 @@ dlt loads data in, dbt transforms it, and **drt** activates it back out — reve
 
 [![drt-core downloads](https://img.shields.io/pepy/dt/drt-core?style=flat-square&logo=pypi&logoColor=white&label=drt-core%20downloads)](https://pepy.tech/projects/drt-core)
 [![dagster-drt downloads](https://img.shields.io/pepy/dt/dagster-drt?style=flat-square&label=dagster-drt%20downloads)](https://pepy.tech/projects/dagster-drt)
-[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-fe8e86?style=flat-square&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/masukai)
+[![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-fe8e86?style=flat-square&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/drt-hub)
 [![Website](https://img.shields.io/badge/website-drt--hub.github.io-7C3AED?style=flat-square)](https://drt-hub.github.io/drt-web/)
 [![X](https://img.shields.io/badge/X-%40drt__hub-000000?style=flat-square&logo=x&logoColor=white)](https://x.com/drt_hub)
 
@@ -166,6 +166,9 @@ drt test --select <name>    # test a specific sync
 drt test --store-failures   # sample up to N failing rows per failed test (masked)
 drt build                   # run each sync and its tests in one pass
 drt validate                # validate sync YAML configs
+drt plan <sync> --out plan.json   # save a reviewable change set (read-only)
+drt apply plan.json         # apply it only if the world still matches
+drt deploy github-actions --with-plan   # PR comment with the plan; apply on merge
 drt status                  # show recent sync status
 drt status --output json    # JSON output for status
 drt profile list            # list credential profiles in ~/.drt/profiles.yml
@@ -175,6 +178,7 @@ drt profile add <name>      # interactively add a profile
 drt profile remove <name>   # remove a profile
 drt serve                   # start HTTP webhook endpoint
 drt docs generate --format mermaid  # print project DAG as Mermaid
+drt docs generate --format dbt-exposures  # print dbt exposure YAML for ref() syncs
 drt deploy github-actions   # scaffold a scheduled sync workflow (drt-action + secrets wired)
 drt mcp run                 # start MCP server (requires drt-core[mcp])
 drt --install-completion    # install shell completion (bash/zsh/fish)
@@ -270,6 +274,8 @@ drt mcp run
 | `drt_doctor`          | Environment diagnostics (mirrors `drt doctor`)                                        |
 | `drt_state_show`      | Stored watermark + last-run state                                                     |
 | `drt_state_reset`     | Reset watermark / run state / tracked-mirror keys                                     |
+| `drt_plan`            | Read-only change set for a sync + a `plan_id` (mirrors `drt plan`)                    |
+| `drt_apply`           | Apply a fetched plan only if the world still matches; needs `approved_by` (`drt apply`) |
 
 ---
 
@@ -295,6 +301,7 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 | ------------------ | --------------------- | ------------------------------------------ |
 | `/drt-create-sync`  | "create a sync"        | Generates valid sync YAML from your intent       |
 | `/drt-debug`        | "sync failed"          | Diagnoses a specific error and suggests fixes    |
+| `/drt-review-sync`  | "what will this change?" | Plans a sync, explains it, applies only after human approval |
 | `/drt-troubleshoot` | "drt isn't working"    | Walks a full top-to-bottom diagnostic checklist  |
 | `/drt-init`         | "set up drt"           | Guides through project initialization            |
 | `/drt-migrate`      | "migrate from Census"  | Converts existing configs to drt YAML            |
@@ -326,7 +333,7 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 ### Destinations
 
 <details>
-<summary><b>34 destinations</b> — warehouses, SaaS APIs, cloud storage, files &amp; webhooks (click to expand)</summary>
+<summary><b>35 destinations</b> — warehouses, SaaS APIs, cloud storage, files &amp; webhooks (click to expand)</summary>
 
 | Connector               | Status    | Install                            | Auth                              |
 | ----------------------- | --------- | ---------------------------------- | --------------------------------- |
@@ -340,6 +347,7 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 | Klaviyo                 | ✅ v0.8   | (core)                             | Private API key (env var)         |
 | Mixpanel                | ✅ v0.8   | (core)                             | Project token / service account   |
 | Google Ads              | ✅ v0.6   | (core)                             | OAuth2 Client Credentials         |
+| Meta Conversions        | ✅ next   | (core)                             | Long-lived access token (env var) |
 | Google Sheets           | ✅ v0.4   | `pip install drt-core[sheets]`     | Service Account Keyfile           |
 | PostgreSQL (upsert)     | ✅ v0.4   | `pip install drt-core[postgres]`   | Password (env var)                |
 | MySQL (upsert)          | ✅ v0.4   | `pip install drt-core[mysql]`      | Password (env var)                |
@@ -384,7 +392,7 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 > **Issue-level tracking → [GitHub Milestones](https://github.com/drt-hub/drt/milestones)**
 > **Looking to contribute? → [Good First Issues](https://github.com/drt-hub/drt/issues?q=is%3Aopen+label%3A%22good+first+issue%22)**
 
-**Shipped:** now on **v0.8.3** — `--dry-run --diff` previews mirror `DELETE`s (all three strategies, read-only) on a keyed lookup that no longer scans the whole destination · `alerts.on_degraded` thresholds for the failures that *succeed* · `drt test` custom SQL `query` tests, `severity: warn`, `--store-failures`, on top of v0.8.2's single-object `drt docs --inline` (navigable hosted catalog on GCS/S3) and v0.8.1's `sync.match_policy` (`update_only` / `create_only` on Postgres + HubSpot) · manifest schema v2, on top of the v0.8.0 `drt docs` lineage site · project `vars:` · `drt build` · dbt-style selection v2. Grouped milestones below; the full per-release changelog lives in [CHANGELOG.md](CHANGELOG.md) and [GitHub Releases](https://github.com/drt-hub/drt/releases).
+**Shipped:** now on **v1.1.0** — Warehouse parity: managed tables, warehouse-backed state/history/DLQ, diff-based incremental and `mirror.strategy: diff` now run on Snowflake, Databricks and BigQuery as well as Postgres, each verified against a live warehouse. Builds on v1.0.0, the first stable release (frozen Source/Destination/StateManager Protocols, `VERSIONING.md` deprecation policy). No breaking changes.
 
 | Milestone            | Highlights                                                                                                                                                             |
 | -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -397,8 +405,13 @@ Copy the files from `.claude/commands/` into your drt project's `.claude/command
 | **v0.8.2** ✅        | **`drt docs --inline` → single navigable HTML object** — the whole catalog in one file with in-page nav, so it renders *and* navigates on an authenticated GCS / S3 object URL (completes v0.8.1's `--inline`) |
 | **v0.8.3** ✅        | **`--dry-run --diff` previews mirror `DELETE`s** (tracked / destination / scoped, read-only, labelled apart from a replace rebuild) · keyed destination lookup instead of a full scan · **`alerts.on_degraded`** (row-error %, duration SLA, empty source, DLQ depth) · `drt test` custom SQL `query` tests, `severity: warn`, `--store-failures` |
 | **v0.8.4** ✅        | **Mirror symmetry closes out** — `strategy: tracked` + `scope` composed together, on every SQL destination (Postgres/MySQL/Snowflake/ClickHouse/Databricks) · tracked mirror's state diff moves from Python to a server-side SQL join · **query tagging** (SQL comment + native BigQuery/Snowflake/Databricks tags) · streaming extraction · source-side retry · rate limiting v2 · `--full-refresh` + `drt state show/reset` |
+| **v0.8.5** ✅        | Databricks composite-key mirror fix — `sync.mode: mirror` + `tracked`/`scope` on a multi-column `upsert_key` now goes through `MERGE` instead of the tuple-`IN` anti-join Delta rejects |
+| **v0.9.0** ✅        | **Engine Foundation** — [ADR 0005](docs/adr/0005-state-location-and-write-grants.md) remote state (GCS/S3 backends for state/history/DLQ, CI-safe, team-shared) · `computed_fields` · `metadata_columns` + `run_id`/`sync_run_id` correlation · REST API `body_mode: batch` · `state:modified` selection · `sync.unit_tests` · secret provider URIs (AWS/GCP Secret Manager, Vault) · `drt serve` real delivery contract (coalescing, `202` + poll, pluggable auth) · CLI/MCP parity gate, 11 gaps closed |
+| **v0.10.0** ✅       | **Enterprise Boundary & Ecosystem** — Protocol stability/freeze prep · OSS product and Enterprise extension boundaries · age-encrypted project secrets · `QueryableDestination` · entry-point plugins usable from YAML · dbt exposures · benchmark/real-I/O/PyO3 evidence · pluggable rate-limit coordination · dagster-drt v0.4.0 event-driven sensors · FileDestination and least-privilege Snowflake mirror fixes |
+| **v1.0.0** ✅        | **Stable Release** — Source/Destination/StateManager Protocol freeze (semver-guaranteed) · migration guide for connector/plugin authors · `Development Status :: 5 - Production/Stable` · hardening pass: `drt serve --auth oidc`, `klaviyo.backfill`, `target/drt/run_results.json` run artifact, `google_ads.cloud_project_id`, DLQ/destination-batch correctness fixes |
+| **v1.1.0** ✅        | **Warehouse parity** — managed tables · warehouse-backed state/history/DLQ · diff-based incremental · `replace`/`mirror` and `mirror.strategy: diff` across Snowflake, Databricks and BigQuery |
 
-**Next:** [v0.9 Engine Foundation](ROADMAP.md#v09--engine-foundation) → [v0.10 Enterprise Boundary & Ecosystem](ROADMAP.md#v010--enterprise-boundary--ecosystem) → [v1.0 Stable Release](ROADMAP.md#v10--stable-release) → [v1.x Rust Engine](ROADMAP.md#v1x--rust-engine)
+**Next:** [v1.2 Reviewable syncs](ROADMAP.md) → [v1.x Rust Engine](ROADMAP.md#v1x--rust-engine)
 
 ---
 
@@ -424,7 +437,14 @@ defs = Definitions(
 )
 ```
 
-See [dagster-drt README](integrations/dagster-drt/README.md) for full API docs (Translator, Pipes support, DrtConfig dry-run, MaterializeResult).
+For event-driven activation, `build_drt_change_sensor()` watches metadata-only
+change signals from Delta Lake, Iceberg, Snowflake, or SQL Server. The same
+resource also runs explicitly selected syncs from a plain Dagster `@op`, returns
+a chainable `DrtEventIterator` for source row-count checks, and powers the
+declarative `DrtSyncComponent` for `defs.yaml` projects.
+
+See [dagster-drt README](integrations/dagster-drt/README.md) for full API docs
+(sensors, Components, `@op`, Translator, Pipes support, and dry-run config).
 
 ---
 
@@ -541,6 +561,10 @@ Every contribution — code, docs, bug reports, ideas — makes drt better. Than
 <!-- ALL-CONTRIBUTORS-LIST:END -->
 
 </details>
+
+## Sponsors
+
+drt is free and open source. If it saves your team time, [sponsoring drt-hub](https://github.com/sponsors/drt-hub) keeps it maintained: it pays for the live warehouse accounts every release is tested against. See [SPONSORS.md](SPONSORS.md) for how it works and who is backing it.
 
 ## Disclaimer
 
