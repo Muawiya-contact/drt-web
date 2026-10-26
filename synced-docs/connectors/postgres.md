@@ -107,7 +107,7 @@ By default `mode: upsert` (and `full` / `incremental`) both *update* rows that a
 
 Skipped rows are counted in the run's **`skipped`** total (`drt run` prints `… N skipped`), not as errors. `match_policy` composes with `field_mappings`, `mask`, and `lookups`. It is **rejected for `mode: replace`** (the TRUNCATE makes only-update / only-create meaningless) and **`mode: mirror`** (its delete pass is a separate design) at validate time, and a destination that doesn't implement it **fails fast** rather than silently upserting. Prior art: Census / Hightouch "Update Only" / "Create Only" sync behaviours.
 
-> **Availability:** shipped on the **Postgres** destination first (clean `rowcount` semantics for the skip count). MySQL and the SaaS/CRM destinations (HubSpot, Salesforce, Intercom, …) — where `update_only` is most valuable — follow as per-destination PRs on the same engine seam ([#757](https://github.com/drt-hub/drt/issues/757)).
+> **Availability:** supported by **Postgres**, **MySQL**, **HubSpot**, and **Intercom**. Salesforce, Klaviyo, and other destinations follow as separate destination-specific PRs on the same engine seam ([#757](https://github.com/drt-hub/drt/issues/757)).
 
 **Mirror mode (differential delete, [#340](https://github.com/drt-hub/drt/issues/340) — v0.7.7+):**
 
@@ -136,6 +136,15 @@ Safety guards:
 - **Failed rows excluded from the key set** — only successfully upserted keys count as "observed source state"; a row that failed during upsert won't cause its destination counterpart to be deleted.
 - **`upsert_key` required** — load() raises `ValueError` before any write if `destination.upsert_key` is empty.
 - **Composite keys supported** — `upsert_key: [tenant_id, employee_id]` produces `WHERE (tenant_id, employee_id) NOT IN ((...), (...))`.
+- **Run-time change guards** — PostgreSQL and MySQL execute the final mirror
+  DELETE inside the finalize transaction, judge its authoritative affected-row
+  count, and roll it back if `sync.guards.max_deletes` / `max_delete_pct` trips.
+  Destination mirror first counts the exact scoped baseline needed for a
+  percentage; tracked mirror counts its staged state baseline; diff mirror has
+  no percentage baseline and therefore fails closed. The tracked-state rewrite
+  begins only after the affected-row guard passes. `drt run --force-guards`
+  proceeds and records the override. Replace-swap is guarded by locked-table
+  counts before the swap; replace-truncate is not.
 
 Memory constraint: the in-process key set is memory-bound to source key cardinality. For tables with **more than a few million keys** the temp-table strategy ([#340 follow-up](https://github.com/drt-hub/drt/issues/340)) will be more appropriate. Mirror as shipped today is appropriate for small/medium reference tables.
 
@@ -154,7 +163,7 @@ Tracked-specific behaviour:
 
 - **First run baselines** — records the key set, deletes nothing (the second and subsequent runs account for deletions).
 - **Lost / missing state re-baselines** — a WARN is logged and no deletes happen that run; the state is rebuilt from the current run.
-- **The diff runs in SQL, not Python ([#694 part 2](https://github.com/drt-hub/drt/issues/694))** — this run's keys are staged into a scratch table and `previously-synced − current-source` is computed with a `NOT EXISTS` join against `_drt_synced_keys`, so a state table with millions of rows is never read into memory just to compute a diff that's typically small. Only the diffed rows (and the genuinely-new keys to insert) ever reach drt's process. **This assumes unscoped tracked mirror** — see the `mirror.scope` note below for why scoped runs don't get the same guarantee yet ([#890](https://github.com/drt-hub/drt/issues/890)).
+- **The diff normally runs in SQL, not Python ([#694 part 2](https://github.com/drt-hub/drt/issues/694))** — this run's keys are staged into a scratch table and `previously-synced − current-source` is computed with a `NOT EXISTS` join against `_drt_synced_keys`, so a state table with millions of rows is never read into memory just to compute a diff that's typically small. Only the diffed rows (and the genuinely-new keys to insert) ever reach drt's process. When the user lacks the optional `TEMPORARY` privilege, drt transparently falls back to reading that sync's state and computing the same diff client-side. **The SQL-side memory guarantee also assumes unscoped tracked mirror** — see the `mirror.scope` note below for why scoped runs don't get the same guarantee yet ([#890](https://github.com/drt-hub/drt/issues/890)).
 - **Target delete + state rewrite are one transaction** — they commit or roll back together, so the bookkeeping can't drift from the data.
 - **State survives ephemeral runners** — it lives in the destination next to the data (`sync_name`, `key_hash`, `key_json` — one row per synced key, scoped per sync), not in local `.drt/` state.
 - **Key types** — int / str keys round-trip exactly; non-JSON-native key types (datetime, Decimal, UUID) are stringified in the state table, a documented limitation.
@@ -181,6 +190,8 @@ Two traps worth calling out:
 
 1. **The DELETE grant fails late, not on the first run.** The first run baselines and issues no deletes, so a missing `DELETE` privilege stays invisible until the *first real generation change* — potentially weeks after rollout. Grant it up front.
 2. **The state table is lazily created — but drt checks existence first.** drt runs `CREATE TABLE IF NOT EXISTS _drt_synced_keys` on the target schema when the table is absent, so by default the sync user needs `CREATE`. Since v0.8.x drt first probes `to_regclass('<schema>._drt_synced_keys')` and **skips the CREATE entirely when the table already exists** — so an admin can pre-provision `_drt_synced_keys` (SQL above) and run the sync user with **no DDL privilege at all**, the sanctioned pattern for "no CREATE for app users" environments.
+
+When `TEMPORARY` is available, tracked mirror uses a temporary staging table for the server-side diff. It is not a required grant: without it drt recovers through a savepoint and performs the equivalent diff client-side. That preserves the no-DDL contract, at the cost of holding the sync's existing tracked-key state in process memory for the fallback; account for that tradeoff on very large state tables.
 
 **Scoped mirror (`mirror.scope`, [#687](https://github.com/drt-hub/drt/issues/687)) — for 1:N regeneration:**
 
@@ -300,6 +311,57 @@ on the server and dies with its session. Two consequences worth knowing: a sync 
 an idle-session reaper or a failover mid-load (that failure is *not* retried, per the scope note
 above), and long-running syncs hold a Postgres backend for their duration. If your server enforces
 a short `idle_in_transaction_session_timeout`, a slow destination can now trip it.
+
+## As a source — drt's own managed bookkeeping schema ([#960](https://github.com/drt-hub/drt/issues/960))
+
+Some opt-in source-side features need drt to create and own a small schema of its own tables in
+your source warehouse. `managed_schema` names where those tables live:
+
+```yaml
+# ~/.drt/profiles.yml
+pg:
+  type: postgres
+  host: localhost
+  dbname: analytics
+  user: analyst
+  password_env: PG_PASSWORD
+  managed_schema: _drt      # default: "_drt" — never "public"
+```
+
+The consumers include [warehouse-backed state](../guides/warehouse-state.md)
+(`state.backend: warehouse`, [#920](https://github.com/drt-hub/drt/issues/920)) and diff-based
+incremental extraction ([#755](https://github.com/drt-hub/drt/issues/755)); both keep their own
+tables in this same schema. See the warehouse-state guide for its table set.
+
+The default is a dedicated schema, not `public` — every reverse-ETL vendor whose approach was
+researched for this design (RudderStack's `_rudderstack`, Segment's `__segment_reverse_etl`,
+Hightouch's `hightouch_planner`) isolates its bookkeeping tables from user data for the same
+blast-radius reason.
+
+**Escape hatch, same discipline as tracked mirror's `_drt_synced_keys`:** an admin can
+pre-create the schema and grant the sync user no `CREATE` privilege at all — drt detects an
+existing schema and never issues the `CREATE SCHEMA` statement in that case. Pre-creating the
+tables too (also with no `CREATE` privilege on the schema) works the same way — drt probes for
+each table's existence before issuing its own `CREATE TABLE`:
+
+```sql
+CREATE SCHEMA _drt;
+GRANT USAGE ON SCHEMA _drt TO retl_user;
+-- Grant table-level privileges on specific tables as each feature that
+-- uses this schema documents them — see the warehouse-backed state guide
+-- for state.backend: warehouse's exact tables and grants.
+```
+
+**Reversible by design ([ADR 0005](../adr/0005-state-location-and-write-grants.md) Decision
+4):** every table a feature creates in this schema can be dropped independently, and dropping
+the last table in the schema never drops the schema itself — other features may share it.
+
+**Concurrent first use is safe.** Two sync processes touching this schema (or one of its tables)
+for the first time at the same moment can both pass the existence probe and both attempt the
+`CREATE` — Postgres does not make `CREATE SCHEMA`/`CREATE TABLE ... IF NOT EXISTS` atomic across
+sessions, so the loser would otherwise see a raw catalog error instead of the graceful no-op the
+`IF NOT EXISTS` clause implies. drt catches that specific race and re-confirms the object exists
+before treating it as a no-op; confirmed live with 8 concurrent first callers.
 
 ## Notes
 
