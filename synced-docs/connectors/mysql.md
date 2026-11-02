@@ -75,6 +75,47 @@ Use `json_columns` to **override** introspection with an explicit allowlist — 
 json_columns: [preferences, metadata]
 ```
 
+**Match policy (`match_policy`, [#757](https://github.com/drt-hub/drt/issues/757)) — only-update / only-create:**
+
+```yaml
+sync:
+  mode: upsert
+  match_policy: update_only   # upsert (default) | update_only | create_only
+destination:
+  type: mysql
+  table: crm.contacts
+  upsert_key: [tenant_id, contact_id]
+```
+
+The default `upsert` policy inserts missing rows and updates existing rows.
+`match_policy` can narrow that behavior when either half would be harmful:
+
+- **`update_only`** emits `UPDATE ... SET ... WHERE <upsert_key>`, so a row
+  missing from MySQL is skipped instead of inserted. It requires at least one
+  non-key column and `SELECT` access to the target: MySQL reports rows changed,
+  not rows matched, so drt performs a key-existence probe only when an UPDATE
+  reports zero. That keeps an existing row whose values were already identical
+  classified as a success rather than a false no-match.
+- **`create_only`** uses a normal `INSERT`. Because MySQL uses the same `1062`
+  response for every PRIMARY or UNIQUE constraint, drt verifies a duplicate
+  against the configured `upsert_key`: an existing match is counted as skipped,
+  while a collision on some other unique constraint remains a normal row error.
+  drt deliberately does not use `INSERT IGNORE`, because MySQL can turn invalid
+  values into warnings and insert coerced data, and it does not use a no-op
+  `ON DUPLICATE KEY UPDATE`, because that would activate UPDATE triggers on rows
+  promised to remain untouched.
+  `create_only` also assumes `upsert_key` is backed by a PRIMARY or UNIQUE index:
+  without one MySQL raises no `1062`, so the plain `INSERT` would add the duplicate
+  row (the same assumption the default `upsert` already makes via
+  `ON DUPLICATE KEY UPDATE`).
+
+Both policies require a non-empty `upsert_key` and `SELECT` access to the target
+table (the probes run only for ambiguous zero-row updates or duplicate inserts).
+Policy-declined rows increment `SyncResult.skipped` and its `skipped_no_match`
+breakdown; they are not errors. The policies compose with field mappings, masks,
+and lookups, but are rejected for `mode: replace` and `mode: mirror`, whose write
+semantics are incompatible.
+
 **Replace mode (TRUNCATE + INSERT):**
 ```yaml
 sync:
@@ -129,6 +170,17 @@ Comparison:
 Safety guards:
 
 - **Empty source short-circuit** — if no batch ever delivered records, the DELETE is skipped. A transient empty source (auth failure mid-extract, vendor outage) cannot wipe the destination.
+- **Run-time change guards** — `sync.guards.max_deletes` and
+  `max_delete_pct` execute the final mirror DELETE inside the finalize
+  transaction, judge its authoritative affected-row count, and roll it back on
+  a trip. Destination mirror first counts the exact scoped percentage baseline;
+  tracked mirror counts its staged-state baseline, while diff mirror has no
+  percentage baseline and fails closed. Guarded finalization also verifies that
+  the target table—and `_drt_synced_keys` for tracked mirror—uses InnoDB; an
+  unknown or non-transactional engine is refused before DELETE because rollback
+  cannot provide the safety contract. `drt run --force-guards` proceeds and
+  records the override. Replace-swap is guarded by locked-table counts before
+  the swap (and also requires an InnoDB target); replace-truncate is not.
 - **Failed rows excluded from the key set** — only successfully upserted keys count as "observed source state"; a row that failed during upsert won't cause its destination counterpart to be deleted.
 - **`upsert_key` required** — load() raises `ValueError` before any write if `destination.upsert_key` is empty.
 - **Composite keys supported** — `upsert_key: [tenant_id, employee_id]` produces `WHERE (tenant_id, employee_id) NOT IN (...)`.
@@ -157,7 +209,7 @@ CREATE TABLE IF NOT EXISTS `analytics`.`_drt_synced_keys` (
   key_hash  CHAR(64)     NOT NULL,
   key_json  TEXT         NOT NULL,
   PRIMARY KEY (sync_name, key_hash)
-);
+) ENGINE=InnoDB;
 GRANT SELECT, INSERT, DELETE ON `analytics`.`_drt_synced_keys` TO 'retl_user'@'%';
 -- table-level grants can be issued before the table exists
 ```
@@ -166,6 +218,8 @@ Two MySQL-specific traps:
 
 1. **The DELETE grant fails late, not on the first run.** The first run baselines and issues no deletes, so a missing `DELETE` privilege only detonates on the *first real generation change* — potentially weeks after rollout. Grant it up front.
 2. **`CREATE TABLE IF NOT EXISTS` still needs `CREATE` — MySQL checks the privilege *before* the existence check**, so pre-creating `_drt_synced_keys` alone did not historically avoid the grant. Since v0.8.x drt first probes `information_schema.tables` and **skips the CREATE entirely when the table already exists**, so an admin can pre-provision the state table (SQL above) and run the sync user with **no DDL privilege** — the sanctioned pattern for "no CREATE for app users" hardening.
+
+Tracked mirror uses a temporary staging table to compute the state diff server-side when the user has `CREATE TEMPORARY TABLES`. That database-scoped privilege is optional: when it is unavailable, drt transparently reads the sync's state and computes the same diff client-side. The no-DDL pre-provisioning contract above therefore stays intact, with the tradeoff that a very large `_drt_synced_keys` set uses correspondingly more process memory during the fallback.
 
 **Scoped mirror (`mirror.scope`, [#687](https://github.com/drt-hub/drt/issues/687)):** `scope: [parent_id]` restricts the mirror DELETE to rows whose scope values appeared in this run's source — the stateless fit for 1:N regeneration (delete stale children under regenerated parents, never touch rows under unobserved parents). Composable with `strategy: tracked` ([#694](https://github.com/drt-hub/drt/issues/694)) for co-writer-safe 1:N regeneration, provided `scope` is a subset of `upsert_key`. See the [Postgres scoped-mirror section](postgres.md) for the full semantics — identical on MySQL.
 

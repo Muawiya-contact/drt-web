@@ -1,0 +1,106 @@
+# Third-Party Plugins (#297)
+
+drt discovers third-party packages via standard Python [entry points](https://packaging.python.org/en/latest/specifications/entry-points/) — the same mechanism pytest, SQLAlchemy, and Flask extensions use. `pip install` your package, and drt picks it up automatically; no import needed in your `drt_project.yml` or anywhere else.
+
+Run `drt plugins list` at any time to see what drt has discovered.
+
+## What works today
+
+Five extension points are fully usable end to end: a plugin registered this way is live the moment its package is installed, with no other configuration.
+
+| Entry-point group | Extends | Registration function |
+|---|---|---|
+| `drt.secret_providers` | New secret-backend URI scheme (like `aws-sm://`, `vault://`) | `drt.config.secret_providers.base.register(scheme, provider)` |
+| `drt.permission_checkers` | Who can run/edit/view which syncs (ADR 0008) | `drt.security.register_permission_checker(checker)` |
+| `drt.audit_loggers` | `config_changed` / `secret_accessed` audit events (ADR 0008) | `drt.observability.register_audit_logger(logger)` |
+| `drt.rate_limiter_backends` | Process-wide rate-limiter construction (ADR 0012) | `drt.destinations.rate_limiter.register_rate_limiter_backend(factory)` |
+| `drt.observers` | Extra `SyncObserver` callbacks (`on_sync_started`, `on_sync_completed`, ...) | `drt.engine.observer.register_extra_observer(observer)` |
+
+### Example: a third-party audit logger
+
+```python
+# my_package/__init__.py
+def register() -> None:
+    from drt.observability import register_audit_logger
+    from .audit import MyAuditLogger
+
+    register_audit_logger(MyAuditLogger())
+```
+
+```toml
+# my_package/pyproject.toml
+[project.entry-points."drt.audit_loggers"]
+my_audit_logger = "my_package:register"
+```
+
+That's the whole contract: **the entry point's value is a zero-argument callable, loaded and invoked once at drt CLI startup.** The callable performs its own registration as a side effect — it is not itself the `AuditLogger`/`PermissionChecker`/etc. instance. This mirrors how drt's built-in connectors self-register in `drt/connectors/registry.py`.
+
+A broken plugin's exception is caught, logged, and reported by `drt plugins list` (`Status: error: ...`) rather than crashing the CLI — one bad third-party package can't take down unrelated commands.
+
+## Rate-limiter backends: `drt.rate_limiter_backends`
+
+This group registers one active backend factory for the process, the same
+replace-not-error shape as `drt.permission_checkers` and
+`drt.audit_loggers`. It is **not** a keyed registry like sources,
+destinations, or secret-provider schemes: registering a second factory
+replaces the first. The existing endpoint-keyed limiter cache remains inside
+the rate-limiting layer and caches whatever the active factory builds.
+
+```python
+# my_package/__init__.py
+def register() -> None:
+    from drt.destinations.rate_limiter import register_rate_limiter_backend
+    from .backend import build_limiter
+
+    register_rate_limiter_backend(build_limiter)
+```
+
+```toml
+# my_package/pyproject.toml
+[project.entry-points."drt.rate_limiter_backends"]
+shared_rate_limiter = "my_package:register"
+```
+
+drt-core supplies the `RateLimiterBackend` contract and keeps its existing
+local limiter as the default; it does not ship a Redis client or any other
+distributed implementation. See [Rate limiting](rate-limiting.md) for the
+Protocol shape, the cross-process caveat, and the zero-code
+`state:modified` mitigation.
+
+## Connectors: `drt.sources` / `drt.destinations`
+
+`drt.sources` and `drt.destinations` entry points are discovered, their registration callables are invoked (so `register_source()` / `register_destination()` in `drt/connectors/registry.py` runs), and **the registered type can be named in a sync YAML like any built-in**:
+
+```yaml
+# syncs/leads.yml — `salesforce_premium` comes from a third-party package
+name: leads_to_salesforce
+model: ref('qualified_leads')
+destination:
+  type: salesforce_premium
+  instance_url: https://acme.my.salesforce.com
+  api_key_env: SF_PREMIUM_KEY
+```
+
+Until #997 this failed `drt validate`: `SyncConfig.destination` and `load_profile()` both checked `type` against a closed, hand-enumerated set of built-ins *before* the connector registry was consulted, so a connector could register itself and still be permanently unreachable. [ADR 0009](../adr/0009-plugin-config-union-blocker.md) records that blocker and how it was closed.
+
+Two things worth knowing when you build one:
+
+- **Subclass `GenericDestinationConfig` and drt validates against your class.** The class you pass to `register_destination(type_name, config_class, destination_class)` parses the YAML when it subclasses `drt.config.models.GenericDestinationConfig` — your field types are enforced, your defaults apply, your `describe()` / `rate_limit_key()` overrides run, and `assert isinstance(config, MyConfig)` in your `load()` holds. Subclassing is what keeps your config inside `SyncConfig.destination`'s declared union, so it serializes cleanly and inherits `retry` / `rate_limit`. Register a plain `BaseModel` (or anything else) and drt falls back to `GenericDestinationConfig`, which carries your fields verbatim without checking them; drt-core reserves a few names (`lookups`, `table`, `upsert_key`, `model`, `mode`) on that path and will tell you if you collide with one.
+- **`retry` and `rate_limit` still work.** Both are inherited from `GenericDestinationConfig`, so `resolve_retry()` and the rate-limiter registry apply to your connector the same way they do to a built-in. Declare them yourself and yours wins.
+
+A typo in the `type` itself is still rejected: an unregistered type is indistinguishable from a misspelled built-in, and is reported as one.
+
+A source plugin's profile class is constructed directly from the `profiles.yml` mapping, so its fields should match the keys operators will write, and it must accept a `type=` keyword and implement `describe() -> str`. Its source methods should accept `ProfileConfigLike` and immediately narrow with `assert isinstance(config, YourProfile)`; see [Building a Source Connector](building-a-source.md#the-profileconfiglike-convention-for-plugins) for the complete pattern and the concrete-parameter contravariance gotcha.
+
+## `drt plugins list`
+
+```
+$ drt plugins list
+┏━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━┳━━━━━━━━━┳━━━━━━━━┳━━━━━━━━┓
+┃ Group                ┃ Name          ┃ Package         ┃ Version ┃ Author ┃ Status ┃
+┡━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━╇━━━━━━━━━╇━━━━━━━━╇━━━━━━━━┩
+│ drt.audit_loggers    │ my_logger     │ my-package      │ 0.1.0   │ ?      │ loaded │
+└──────────────────────┴───────────────┴─────────────────┴─────────┴────────┴────────┘
+```
+
+`--format json` emits the same data as machine-readable JSON, including a `usable_in_sync_yaml` — `true` once the entry point loaded and registered itself, `false` only when loading failed. Connector groups are no longer a special case (#997); check `error` for why a `false` entry failed.

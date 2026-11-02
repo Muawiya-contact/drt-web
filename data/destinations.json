@@ -96,6 +96,11 @@
       "kind": "destination"
     },
     {
+      "type": "meta_conversions",
+      "display_name": "Meta Conversions",
+      "kind": "destination"
+    },
+    {
       "type": "mixpanel",
       "display_name": "Mixpanel",
       "kind": "destination"
@@ -148,6 +153,11 @@
     {
       "type": "snowflake",
       "display_name": "Snowflake",
+      "kind": "destination"
+    },
+    {
+      "type": "sqs",
+      "display_name": "Amazon SQS",
       "kind": "destination"
     },
     {

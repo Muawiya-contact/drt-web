@@ -1,19 +1,21 @@
 # Building a Destination Connector
 
-This guide walks through adding a new destination connector to drt, step by step. By the end you will have a working connector with config validation, error handling, and tests.
+This guide walks through adding a new destination connector *in-tree* (contributed directly to drt-core), step by step. By the end you will have a working connector with config validation, error handling, and tests.
+
+An out-of-tree destination registered through the `drt.destinations` entry point is nameable in a sync YAML like a built-in, and the config class you register is what parses it (#997) — see [Third-Party Plugins](plugins.md).
 
 We will build a fictional **Webhook** destination as our running example -- a generic HTTP POST sender that pushes each row as JSON to a URL. The same pattern applies to databases, SaaS APIs, and message queues.
 
 ## Overview
 
-Adding a destination requires four changes:
+Adding an in-tree destination requires four groups of changes:
 
 | Step | File(s) | What you add |
 |------|---------|-------------|
 | 1. Config model | `drt/config/models.py` | Pydantic model for YAML config |
 | 2. Destination class | `drt/destinations/webhook.py` | `load()` implementation |
-| 3. CLI registration | `drt/cli/main.py` | isinstance branch |
-| 4. Tests | `tests/unit/test_webhook_destination.py` | Unit tests |
+| 3. Registry wiring | `drt/connectors/registry.py` | Config and destination imports plus a `register_destination()` entry |
+| 4. Tests and docs | `tests/unit/test_webhook_destination.py`, `docs/connectors/webhook.md` | Unit tests and user-facing documentation; add an optional extra in `pyproject.toml` if needed and a `CHANGELOG.md` entry |
 
 ## Prerequisites
 
@@ -30,7 +32,7 @@ make test                  # verify everything passes before you start
 Open `drt/config/models.py` and add your config class. Every destination config must have a `type` field with a `Literal` value that matches the YAML `type:` key.
 
 ```python
-class WebhookDestinationConfig(BaseModel):
+class WebhookDestinationConfig(GenericDestinationConfig):
     type: Literal["webhook"]
     url: str | None = None
     url_env: str | None = None
@@ -196,21 +198,59 @@ For database connectors, the pattern differs slightly:
 
 See `drt/destinations/postgres.py` for the reference implementation.
 
----
+### Optional advanced sync modes
 
-## Step 3: CLI Registration
+Every destination supports `sync.mode: full`, `incremental`, and `upsert`
+through its normal `load()` path. A destination must opt in to `replace` or
+`mirror`, because those modes require additional destination-side operations
+such as truncating/swapping a table or deleting rows absent from the source.
 
-Open `drt/cli/main.py` and add your destination to `_get_destination()`:
+Implement the separate `ModeCapable` Protocol only after the connector has the
+complete machinery for each mode it declares:
 
 ```python
-from drt.destinations.webhook import WebhookDestination
+from drt.destinations.base import ModeCapable
 
-# Inside _get_destination():
-if isinstance(dest, WebhookDestinationConfig):
-    return WebhookDestination()
+
+class MyDatabaseDestination:
+    def supported_modes(self) -> frozenset[str]:
+        return frozenset({"replace", "mirror"})
+
+
+assert isinstance(MyDatabaseDestination(), ModeCapable)
 ```
 
-Add it before the final `raise ValueError(...)` line. No plugin registry needed.
+`supported_modes()` returns only the subset of `{"replace", "mirror"}` the
+destination actually honours; do not include the three always-safe modes. The
+engine discovers this optional capability with
+`isinstance(destination, ModeCapable)` and fails before extraction or writes
+when a configured advanced mode is undeclared. **Declare this on the concrete
+destination, never on a shared abstract base** — `BaseSqlDestination`
+deliberately does not implement `supported_modes()` itself, because its
+`_load_replace_swap` / `_build_mirror_delete` / etc. hooks are abstract
+(`NotImplementedError`) until a dialect subclass fills them in; a subclass
+that only wants some of that machinery (e.g. plain upsert) must not silently
+inherit a capability it can't actually serve — Postgres, MySQL, Snowflake,
+and Databricks each declare it individually for this reason. Keep this
+capability separate from the frozen `Destination` Protocol, following the
+same extension pattern as `ConnectionTestable`, `MatchPolicyCapable`, `StagedDestination`,
+`OrphanCleanup`, and `QueryableDestination`.
+
+---
+
+## Step 3: Registry Wiring
+
+Update `_register_all_connectors()` in `drt/connectors/registry.py`:
+
+```python
+from drt.config.models import WebhookDestinationConfig
+from drt.destinations.webhook import WebhookDestination
+
+# Alongside the other built-in registrations:
+register_destination("webhook", WebhookDestinationConfig, WebhookDestination)
+```
+
+The CLI, MCP server, and integrations all resolve destinations through this registry; there is no separate `isinstance` branch to add in `drt/cli/main.py`.
 
 ---
 
@@ -343,8 +383,12 @@ make test       # all tests
 - [ ] Uses `try/finally` for connection cleanup (database destinations)
 - [ ] Builds `RowError` on per-row failures
 - [ ] Respects `on_error` ("fail" returns early, "skip" continues)
-- [ ] isinstance branch in `_get_destination()` in `drt/cli/main.py`
+- [ ] Config and destination imported and registered with `register_destination()` in `drt/connectors/registry.py`
 - [ ] Tests cover: success, skip, fail-stops-early, missing config
+- [ ] `drt plan` coverage declared in `drt/engine/plan_coverage.py` (`available`, `partial`, `needs-api-diff` or `unavailable`, with a reason), then `python scripts/gen_plan_coverage.py` ([coverage](plan-coverage.md)); CI fails without it
+- [ ] Connector documentation added under `docs/connectors/`
+- [ ] Optional dependency extra added to `pyproject.toml` (if needed)
+- [ ] `CHANGELOG.md` updated under `[Unreleased]`
 - [ ] `make lint` passes
 - [ ] `make test` passes
 
